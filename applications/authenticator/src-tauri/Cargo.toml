@@ -27,7 +27,7 @@ tauri-plugin-fs = "2.5.1"
 tauri-plugin-store = "2.4.3"
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 tauri-plugin-process = "2.3.1"
-tauri-plugin-log = "2.8.0"
+tauri-plugin-log = "2.9.0"
 log = "0.4.29"
 tauri-plugin-http = { version = "2.5.9", features = ["unsafe-headers", "dangerous-settings"] }
 rand = { version = "0.10.0" }
@@ -38,6 +38,9 @@ base64 = { version = "0.22.1" }
 specta = { version = "=2.0.0-rc.24" }
 specta-typescript = { version = "=0.0.11" }
 tauri-specta = { version = "=2.0.0-rc.24", features = ["derive", "typescript"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.177"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-local-authentication = "0.3.2"

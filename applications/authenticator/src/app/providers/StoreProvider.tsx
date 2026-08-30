@@ -2,6 +2,7 @@ import type { FC, PropsWithChildren } from 'react';
 import { Provider } from 'react-redux';
 
 import { getApi } from 'proton-authenticator/lib/api';
+import { HelperPublisher } from 'proton-authenticator/lib/helper/HelperPublisher';
 import type { AppModal } from 'proton-authenticator/store';
 import { setupStore } from 'proton-authenticator/store';
 import { init } from 'proton-authenticator/store/app';
@@ -49,6 +50,7 @@ export const StoreProvider: FC<PropsWithChildren> = ({ children }) => {
 
     return (
         <Provider store={store}>
+            <HelperPublisher />
             {children}
 
             {appModal.state.open && (
