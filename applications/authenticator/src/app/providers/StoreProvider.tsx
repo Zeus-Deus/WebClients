@@ -14,6 +14,7 @@ import { useStatefulRef } from '@proton/pass/hooks/useStatefulRef';
 import clsx from '@proton/utils/clsx';
 
 import { getApi } from '../../lib/api';
+import { HelperPublisher } from '../../lib/helper/HelperPublisher';
 import type { AppModal } from '../../store';
 import { setupStore } from '../../store';
 import { init } from '../../store/app';
@@ -49,6 +50,7 @@ export const StoreProvider: FC<PropsWithChildren> = ({ children }) => {
 
     return (
         <Provider store={store}>
+            <HelperPublisher />
             {children}
 
             {appModal.state.open && (

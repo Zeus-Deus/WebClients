@@ -9,6 +9,8 @@ mod auth;
 mod biometrics;
 mod crypto;
 mod error;
+#[cfg(target_os = "linux")]
+mod helper;
 mod storage_key;
 mod store;
 
@@ -33,6 +35,22 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     apply_webkitgtk_workaround();
 
+    #[cfg(target_os = "linux")]
+    let builder = Builder::<tauri::Wry>::new()
+        .commands(collect_commands![
+            auth::log_in,
+            biometrics::can_check_presence,
+            biometrics::check_presence,
+            helper::publish_helper_snapshot,
+            storage_key::generate_storage_key,
+            storage_key::get_storage_key,
+            storage_key::remove_storage_key,
+            store::get_theme,
+            store::set_theme,
+        ])
+        .events(collect_events![]);
+
+    #[cfg(not(target_os = "linux"))]
     let builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             auth::log_in,
@@ -54,10 +72,18 @@ pub fn run() {
         )
         .expect("Failed to export typescript bindings");
 
-    tauri::Builder::default()
+    let app_builder = tauri::Builder::default();
+    #[cfg(target_os = "linux")]
+    let app_builder = app_builder.manage(helper::HelperState::default());
+
+    app_builder
         .invoke_handler(builder.invoke_handler())
         .setup(|app| {
             let version = app.package_info().version.to_string();
+            #[cfg(target_os = "linux")]
+            let background_mode = std::env::args().any(|arg| arg == "--background");
+            #[cfg(target_os = "linux")]
+            let login_requested = std::env::args().any(|arg| arg == "--login");
             let mut win_builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Proton Authenticator")
                 .user_agent(&auth::get_user_agent(version))
@@ -65,11 +91,33 @@ pub fn run() {
                 .inner_size(800.0, 600.0)
                 .min_inner_size(420.0, 480.0);
 
+            #[cfg(target_os = "linux")]
+            if background_mode && !login_requested {
+                win_builder = win_builder.visible(false);
+            }
+
             if !cfg!(debug_assertions) {
                 win_builder = win_builder.content_protected(true)
             }
 
-            win_builder.build()?;
+            let window = win_builder.build()?;
+
+            #[cfg(not(target_os = "linux"))]
+            let _ = window;
+
+            #[cfg(target_os = "linux")]
+            if background_mode {
+                let helper_window = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = helper_window.hide();
+                    }
+                });
+            }
+
+            #[cfg(target_os = "linux")]
+            helper::start_socket_server(app.state::<helper::HelperState>().inner().clone())?;
 
             Ok(())
         })
@@ -90,10 +138,19 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = app
-                .get_webview_window("main")
-                .and_then(|window| window.set_focus().ok());
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let login_requested = args.iter().any(|arg| arg == "--login");
+            #[cfg(target_os = "linux")]
+            if login_requested {
+                app.state::<helper::HelperState>().unlock();
+            }
+            let _ = app.get_webview_window("main").and_then(|window| {
+                if login_requested {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                }
+                window.set_focus().ok()
+            });
         }))
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_fs::init())
