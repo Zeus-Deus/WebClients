@@ -177,6 +177,13 @@ impl HelperState {
         Ok(())
     }
 
+    /// Clears the manual lock latch and drops the published snapshot.
+    ///
+    /// Neither the socket nor the `--login` argv path may clear the latch, so
+    /// there is no production caller: a manual lock now persists for the life of
+    /// the process and is released by restarting the app. Retained for the tests
+    /// that cover the suppress-then-resume publication semantics.
+    #[cfg(test)]
     pub fn unlock(&self) {
         if let Ok(mut snapshot) = self.snapshot.write() {
             self.manual_locked.store(false, Ordering::Release);
@@ -481,19 +488,9 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
                 json!({ "ok": true, "state": "locked", "locked": true, "generation": snapshot.generation }),
             )
         }
-        "unlock" => {
-            state.unlock();
-            let snapshot = state.snapshot.read().expect("snapshot lock poisoned");
-            envelope(
-                &request.id,
-                json!({
-                    "ok": true,
-                    "state": snapshot.state,
-                    "locked": false,
-                    "generation": snapshot.generation,
-                }),
-            )
-        }
+        // `unlock` is deliberately not exposed over the socket: the lock
+        // direction is fail-safe, but a remotely triggerable unlock would let any
+        // same-uid process clear the manual lock latch without confirmation.
         _ => envelope(
             &request.id,
             json!({ "ok": false, "error": "unsupported_operation" }),
@@ -736,7 +733,11 @@ mod tests {
                 item_id: None,
             },
         );
-        assert_eq!(unlock_response["ok"], true);
+        assert_eq!(unlock_response["ok"], false);
+        assert_eq!(unlock_response["error"], "unsupported_operation");
+        assert!(state.snapshot.read().unwrap().locked);
+
+        state.unlock();
         state.publish(republished).unwrap();
         let snapshot = state.snapshot.read().unwrap();
         assert!(!snapshot.locked);
