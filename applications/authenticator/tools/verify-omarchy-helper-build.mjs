@@ -58,9 +58,40 @@ export function verifyDistBundle(dist) {
     return scripts.length;
 }
 
+/** `dist` being clean is not sufficient: Tauri's codegen keeps a compressed
+ * asset cache under the Cargo `OUT_DIR` that Cargo never prunes, so blobs from
+ * earlier QA-enabled builds survive `rm -rf dist`. They only stay out of the
+ * binary while `dist` does not reference them, which is a property of the last
+ * build rather than a guarantee. Assert the shipped binary embeds exactly the
+ * bundles the current `dist` declares. */
+export function verifyEmbeddedBundles(binary, dist) {
+    if (!fs.existsSync(binary)) throw new Error(`helper binary missing: ${binary}`);
+    const expected = new Set(
+        walkFiles(dist)
+            .filter((file) => file.endsWith('.js'))
+            .map((file) => path.basename(file))
+    );
+    const contents = fs.readFileSync(binary, 'latin1');
+    const embedded = new Set(contents.match(/main\.[0-9a-f]{6,}\.js/g) ?? []);
+    const strays = [...embedded].filter((name) => !expected.has(name));
+    if (strays.length > 0) {
+        throw new Error(`refusing helper binary embedding stale bundles: ${strays.join(', ')}`);
+    }
+    const sourceMaps = new Set(contents.match(/[\w.-]+\.js\.map/g) ?? []);
+    if (sourceMaps.size > 0) {
+        throw new Error(`refusing helper binary embedding source maps: ${[...sourceMaps].join(', ')}`);
+    }
+    return embedded.size;
+}
+
+
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-    const [root, dist] = process.argv.slice(2);
-    if (!root || !dist) throw new Error('usage: verify-omarchy-helper-build.mjs <fingerprint-root> <dist>');
+    const [root, dist, binary] = process.argv.slice(2);
+    if (!root || !dist) throw new Error('usage: verify-omarchy-helper-build.mjs <fingerprint-root> <dist> [binary]');
     process.stdout.write(`${verifyLatestFingerprint(path.resolve(root))}\n`);
     process.stdout.write(`${verifyDistBundle(path.resolve(dist))} bundle scripts verified\n`);
+    if (binary) {
+        const embedded = verifyEmbeddedBundles(path.resolve(binary), path.resolve(dist));
+        process.stdout.write(`${embedded} embedded bundle(s) verified\n`);
+    }
 }
