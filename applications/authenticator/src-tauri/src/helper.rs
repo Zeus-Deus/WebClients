@@ -9,7 +9,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -19,6 +19,11 @@ const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CLIPBOARD_TTL: Duration = Duration::from_secs(20);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CONNECTIONS: usize = 16;
+const MAX_CLIPBOARD_BYTES: u64 = 64;
+const WL_COPY: &str = "/usr/bin/wl-copy";
+const WL_PASTE: &str = "/usr/bin/wl-paste";
 
 #[derive(Clone, Debug, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -64,28 +69,59 @@ impl Default for HelperSnapshot {
 pub struct HelperState {
     snapshot: Arc<RwLock<HelperSnapshot>>,
     manual_locked: Arc<AtomicBool>,
+    login_requested: Arc<AtomicBool>,
+    clipboard_generation: Arc<AtomicU64>,
 }
 
 impl HelperState {
-    fn publish(&self, snapshot: HelperSnapshot) -> Result<(), String> {
+    pub fn with_login_requested(login_requested: bool) -> Self {
+        Self {
+            login_requested: Arc::new(AtomicBool::new(login_requested)),
+            ..Self::default()
+        }
+    }
+
+    pub fn request_login(&self) {
+        self.login_requested.store(true, Ordering::Release);
+    }
+
+    pub fn take_login_request(&self) -> bool {
+        self.login_requested.swap(false, Ordering::AcqRel)
+    }
+
+    fn next_clipboard_generation(&self) -> u64 {
+        self.clipboard_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    fn is_current_clipboard_generation(&self, generation: u64) -> bool {
+        self.clipboard_generation.load(Ordering::Acquire) == generation
+    }
+
+    fn publish(&self, mut snapshot: HelperSnapshot) -> Result<(), String> {
         validate_snapshot(&snapshot)?;
+        let mut current = self
+            .snapshot
+            .write()
+            .map_err(|_| "snapshot_lock".to_string())?;
         if self.manual_locked.load(Ordering::Acquire) {
             return Ok(());
         }
+        snapshot.generation = snapshot
+            .generation
+            .max(current.generation.saturating_add(1));
         let encoded = serde_json::to_vec(&snapshot).map_err(|_| "snapshot_encode".to_string())?;
         if encoded.len() > MAX_RESPONSE_BYTES {
             return Err("snapshot_too_large".into());
         }
-        *self
-            .snapshot
-            .write()
-            .map_err(|_| "snapshot_lock".to_string())? = snapshot;
+        *current = snapshot;
         Ok(())
     }
 
     pub fn unlock(&self) {
-        self.manual_locked.store(false, Ordering::Release);
         if let Ok(mut snapshot) = self.snapshot.write() {
+            self.manual_locked.store(false, Ordering::Release);
             snapshot.state = "unavailable".into();
             snapshot.locked = false;
             snapshot.entries.clear();
@@ -104,7 +140,19 @@ struct HelperRequest {
 }
 
 fn bounded_text(value: &str, max: usize) -> bool {
-    value.chars().count() <= max && !value.chars().any(|c| c.is_control())
+    value.len() <= max
+        && !value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{feff}'
+                )
+        })
 }
 
 fn valid_id(value: &str) -> bool {
@@ -161,6 +209,12 @@ pub fn publish_helper_snapshot(
     snapshot: HelperSnapshot,
 ) -> Result<(), String> {
     state.inner().publish(snapshot)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn take_helper_login_request(state: tauri::State<'_, HelperState>) -> bool {
+    state.inner().take_login_request()
 }
 
 fn socket_path() -> io::Result<PathBuf> {
@@ -261,8 +315,32 @@ fn snapshot_response(id: &str, snapshot: &HelperSnapshot) -> Value {
     envelope(id, body)
 }
 
-fn copy_to_clipboard(code: String) -> io::Result<()> {
-    let mut child = Command::new("wl-copy").stdin(Stdio::piped()).spawn()?;
+fn read_clipboard_bounded() -> io::Result<Option<Vec<u8>>> {
+    let mut child = Command::new(WL_PASTE)
+        .arg("--no-newline")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut bytes = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "clipboard stdout unavailable"))?
+        .take(MAX_CLIPBOARD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CLIPBOARD_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    }
+    if !child.wait()?.success() {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn copy_to_clipboard(state: &HelperState, code: &str) -> io::Result<()> {
+    let mut child = Command::new(WL_COPY).stdin(Stdio::piped()).spawn()?;
     child
         .stdin
         .take()
@@ -272,12 +350,17 @@ fn copy_to_clipboard(code: String) -> io::Result<()> {
         return Err(io::Error::other("wl-copy failed"));
     }
 
+    let expiration = state.next_clipboard_generation();
+    let state = state.clone();
+    let code = code.as_bytes().to_vec();
     thread::spawn(move || {
         thread::sleep(CLIPBOARD_TTL);
-        let current = Command::new("wl-paste").arg("--no-newline").output();
-        if let Ok(current) = current {
-            if current.status.success() && current.stdout == code.as_bytes() {
-                let _ = Command::new("wl-copy").arg("--clear").status();
+        if !state.is_current_clipboard_generation(expiration) {
+            return;
+        }
+        if let Ok(Some(current)) = read_clipboard_bounded() {
+            if current == code && state.is_current_clipboard_generation(expiration) {
+                let _ = Command::new(WL_COPY).arg("--clear").status();
             }
         }
     });
@@ -327,18 +410,14 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
                     json!({ "ok": false, "error": "invalid_item_id" }),
                 );
             };
-            let snapshot = state
-                .snapshot
-                .read()
-                .expect("snapshot lock poisoned")
-                .clone();
+            let snapshot = state.snapshot.read().expect("snapshot lock poisoned");
             if snapshot.locked || snapshot.state != "ready" {
                 return envelope(&request.id, json!({ "ok": false, "error": "locked" }));
             }
             let Some(entry) = snapshot.entries.iter().find(|entry| entry.id == item_id) else {
                 return envelope(&request.id, json!({ "ok": false, "error": "not_found" }));
             };
-            match copy_to_clipboard(entry.code.clone()) {
+            match copy_to_clipboard(state, &entry.code) {
                 Ok(()) => envelope(
                     &request.id,
                     json!({ "ok": true, "copied": true, "generation": snapshot.generation }),
@@ -350,8 +429,8 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
             }
         }
         "lock" => {
-            state.manual_locked.store(true, Ordering::Release);
             let mut snapshot = state.snapshot.write().expect("snapshot lock poisoned");
+            state.manual_locked.store(true, Ordering::Release);
             snapshot.locked = true;
             snapshot.state = "locked".into();
             snapshot.entries.clear();
@@ -359,6 +438,19 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
             envelope(
                 &request.id,
                 json!({ "ok": true, "state": "locked", "locked": true, "generation": snapshot.generation }),
+            )
+        }
+        "unlock" => {
+            state.unlock();
+            let snapshot = state.snapshot.read().expect("snapshot lock poisoned");
+            envelope(
+                &request.id,
+                json!({
+                    "ok": true,
+                    "state": snapshot.state,
+                    "locked": false,
+                    "generation": snapshot.generation,
+                }),
             )
         }
         _ => envelope(
@@ -369,6 +461,8 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
 }
 
 fn handle_client(state: HelperState, mut stream: UnixStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
+    stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
     if peer_uid(&stream)? != unsafe { libc::geteuid() } {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -396,17 +490,36 @@ fn handle_client(state: HelperState, mut stream: UnixStream) -> io::Result<()> {
     stream.write_all(&encoded)
 }
 
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub fn start_socket_server(state: HelperState) -> io::Result<PathBuf> {
     let path = socket_path()?;
     let listener = prepare_socket(&path)?;
+    let active_connections = Arc::new(AtomicUsize::new(0));
     thread::Builder::new()
         .name("omarchy-authenticator-helper".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
+                if active_connections
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        (count < MAX_CONNECTIONS).then_some(count + 1)
+                    })
+                    .is_err()
+                {
+                    continue;
+                }
                 let state = state.clone();
+                let guard = ConnectionGuard(active_connections.clone());
                 let _ = thread::Builder::new()
                     .name("omarchy-authenticator-client".into())
                     .spawn(move || {
+                        let _guard = guard;
                         let _ = handle_client(state, stream);
                     });
             }
@@ -440,6 +553,24 @@ mod tests {
     }
 
     #[test]
+    fn login_request_latch_is_consumed_once() {
+        let state = HelperState::with_login_requested(true);
+        assert!(state.take_login_request());
+        assert!(!state.take_login_request());
+        state.request_login();
+        assert!(state.take_login_request());
+    }
+
+    #[test]
+    fn clipboard_generation_renews_expiration() {
+        let state = HelperState::default();
+        let first = state.next_clipboard_generation();
+        let second = state.next_clipboard_generation();
+        assert!(!state.is_current_clipboard_generation(first));
+        assert!(state.is_current_clipboard_generation(second));
+    }
+
+    #[test]
     fn validates_bounded_snapshot() {
         assert!(validate_snapshot(&valid_snapshot()).is_ok());
     }
@@ -460,6 +591,24 @@ mod tests {
         let mut snapshot = valid_snapshot();
         snapshot.entries[0].id = "../bad".into();
         snapshot.entries[0].code = "12 3456".into();
+        assert_eq!(validate_snapshot(&snapshot), Err("invalid_entry".into()));
+    }
+
+    #[test]
+    fn rejects_bidi_and_zero_width_labels() {
+        for character in [
+            '\u{061c}', '\u{200b}', '\u{200e}', '\u{200f}', '\u{202e}', '\u{2060}',
+        ] {
+            let mut snapshot = valid_snapshot();
+            snapshot.entries[0].name = format!("safe{character}spoof");
+            assert_eq!(validate_snapshot(&snapshot), Err("invalid_entry".into()));
+        }
+    }
+
+    #[test]
+    fn rejects_labels_over_utf8_byte_limit() {
+        let mut snapshot = valid_snapshot();
+        snapshot.entries[0].name = "ü".repeat(80);
         assert_eq!(validate_snapshot(&snapshot), Err("invalid_entry".into()));
     }
 
@@ -508,11 +657,21 @@ mod tests {
         assert!(state.snapshot.read().unwrap().locked);
         assert!(state.snapshot.read().unwrap().entries.is_empty());
 
-        state.unlock();
+        let unlock_response = handle_request(
+            &state,
+            HelperRequest {
+                v: 1,
+                id: "efgh".into(),
+                op: "unlock".into(),
+                item_id: None,
+            },
+        );
+        assert_eq!(unlock_response["ok"], true);
         state.publish(republished).unwrap();
         let snapshot = state.snapshot.read().unwrap();
         assert!(!snapshot.locked);
         assert_eq!(snapshot.state, "ready");
         assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.generation, 4);
     }
 }

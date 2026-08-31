@@ -1,5 +1,6 @@
 import { type FC, useState } from 'react';
 
+import { HelperLoginBridge } from '../components/HelperLoginBridge';
 import { ItemAdd } from '../components/Items/ItemAdd';
 import { Navbar } from '../components/Layout/Navbar';
 import { Items } from './ItemsScreen';
@@ -23,6 +24,7 @@ export const App: FC = () => {
             />
 
             <Items search={search} handleNewClick={handleNewClick} />
+            <HelperLoginBridge />
 
             {dialogOpen && <ItemAdd onClose={() => setDialogOpen(false)} />}
             {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} />}

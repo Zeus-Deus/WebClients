@@ -1,8 +1,8 @@
-use log::LevelFilter;
-
 #[cfg(debug_assertions)]
 use specta_typescript::Typescript;
 
+#[cfg(target_os = "linux")]
+use tauri::Emitter;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod auth;
@@ -30,10 +30,65 @@ fn apply_webkitgtk_workaround() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn helper_window_mode<I, S>(args: I) -> (bool, bool)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut background = false;
+    let mut login = false;
+    for argument in args {
+        match argument.as_ref() {
+            "--background" => background = true,
+            "--login" => login = true,
+            _ => {}
+        }
+    }
+    (background, login)
+}
+
+#[cfg(target_os = "linux")]
+fn helper_log_level(background: bool) -> log::LevelFilter {
+    if background {
+        log::LevelFilter::Off
+    } else {
+        log::LevelFilter::Debug
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{helper_log_level, helper_window_mode};
+
+    #[test]
+    fn helper_window_mode_hides_background_except_login() {
+        assert_eq!(helper_window_mode(["app", "--background"]), (true, false));
+        assert_eq!(
+            helper_window_mode(["app", "--background", "--login"]),
+            (true, true)
+        );
+        assert_eq!(helper_window_mode(["app"]), (false, false));
+    }
+
+    #[test]
+    fn background_helper_disables_application_logging() {
+        assert_eq!(helper_log_level(true), log::LevelFilter::Off);
+        assert_eq!(helper_log_level(false), log::LevelFilter::Debug);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
     apply_webkitgtk_workaround();
+
+    #[cfg(target_os = "linux")]
+    let initial_helper_mode = helper_window_mode(std::env::args());
+    #[cfg(target_os = "linux")]
+    let log_level = helper_log_level(initial_helper_mode.0);
+    #[cfg(not(target_os = "linux"))]
+    let log_level = log::LevelFilter::Debug;
 
     #[cfg(target_os = "linux")]
     let builder = Builder::<tauri::Wry>::new()
@@ -42,6 +97,7 @@ pub fn run() {
             biometrics::can_check_presence,
             biometrics::check_presence,
             helper::publish_helper_snapshot,
+            helper::take_helper_login_request,
             storage_key::generate_storage_key,
             storage_key::get_storage_key,
             storage_key::remove_storage_key,
@@ -74,16 +130,16 @@ pub fn run() {
 
     let app_builder = tauri::Builder::default();
     #[cfg(target_os = "linux")]
-    let app_builder = app_builder.manage(helper::HelperState::default());
+    let app_builder = app_builder.manage(helper::HelperState::with_login_requested(
+        initial_helper_mode.1,
+    ));
 
     app_builder
         .invoke_handler(builder.invoke_handler())
-        .setup(|app| {
+        .setup(move |app| {
             let version = app.package_info().version.to_string();
             #[cfg(target_os = "linux")]
-            let background_mode = std::env::args().any(|arg| arg == "--background");
-            #[cfg(target_os = "linux")]
-            let login_requested = std::env::args().any(|arg| arg == "--login");
+            let (background_mode, login_requested) = initial_helper_mode;
             let mut win_builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Proton Authenticator")
                 .user_agent(&auth::get_user_agent(version))
@@ -101,6 +157,11 @@ pub fn run() {
             }
 
             let window = win_builder.build()?;
+
+            #[cfg(target_os = "linux")]
+            if background_mode && !login_requested {
+                window.hide()?;
+            }
 
             #[cfg(not(target_os = "linux"))]
             let _ = window;
@@ -124,7 +185,7 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .clear_targets()
-                .level(LevelFilter::Debug)
+                .level(log_level)
                 .target(tauri_plugin_log::Target::new(
                     tauri_plugin_log::TargetKind::Stdout,
                 ))
@@ -142,13 +203,14 @@ pub fn run() {
             let login_requested = args.iter().any(|arg| arg == "--login");
             #[cfg(target_os = "linux")]
             if login_requested {
-                app.state::<helper::HelperState>().unlock();
+                let state = app.state::<helper::HelperState>();
+                state.unlock();
+                state.request_login();
+                let _ = app.emit_to("main", "omarchy-helper:login", ());
             }
             let _ = app.get_webview_window("main").and_then(|window| {
-                if login_requested {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                }
+                let _ = window.show();
+                let _ = window.unminimize();
                 window.set_focus().ok()
             });
         }))
