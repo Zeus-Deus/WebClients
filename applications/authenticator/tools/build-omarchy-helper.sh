@@ -34,5 +34,5 @@ if [[ ! -x "$BINARY" ]]; then
   printf 'helper build missing: %s\n' "$BINARY" >&2
   exit 1
 fi
-node "$VERIFY_SCRIPT" "$FINGERPRINT_ROOT" "$DIST_DIR"
+node "$VERIFY_SCRIPT" "$FINGERPRINT_ROOT" "$DIST_DIR" "$BINARY"
 sha256sum "$BINARY"

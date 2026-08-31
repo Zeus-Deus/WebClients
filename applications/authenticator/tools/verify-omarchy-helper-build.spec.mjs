@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { verifyDistBundle, verifyLatestFingerprint } from './verify-omarchy-helper-build.mjs';
+import { verifyDistBundle, verifyEmbeddedBundles, verifyLatestFingerprint } from './verify-omarchy-helper-build.mjs';
 
 function writeFingerprint(root, name, features, mtimeMs) {
     const dir = path.join(root, name);
@@ -77,4 +77,45 @@ test('rejects a bundle with no scripts at all', () => {
 test('rejects a missing bundle directory', () => {
     const dist = path.join(os.tmpdir(), `helper-dist-missing-${process.pid}`);
     assert.throws(() => verifyDistBundle(dist), /bundle missing/);
+});
+
+function writeBinary(contents) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'helper-binary-'));
+    const file = path.join(dir, 'proton-authenticator');
+    fs.writeFileSync(file, contents, 'latin1');
+    return file;
+}
+
+test('accepts a binary embedding only the current bundle', () => {
+    const dist = writeDist({
+        'index.html': '<script src="main.0783a71b.js"></script>',
+        'assets/static/main.0783a71b.js': 'console.log("ok")',
+    });
+    const binary = writeBinary('\u0000ELF junk assets/static/main.0783a71b.js more junk');
+    assert.equal(verifyEmbeddedBundles(binary, dist), 1);
+    fs.rmSync(dist, { recursive: true });
+    fs.rmSync(path.dirname(binary), { recursive: true });
+});
+
+test('rejects a binary embedding bundles that are no longer in dist', () => {
+    const dist = writeDist({ 'assets/static/main.0783a71b.js': 'console.log("ok")' });
+    const binary = writeBinary('main.0783a71b.js and the stale main.802de1c3.js');
+    assert.throws(() => verifyEmbeddedBundles(binary, dist), /stale bundles: main\.802de1c3\.js/);
+    fs.rmSync(dist, { recursive: true });
+    fs.rmSync(path.dirname(binary), { recursive: true });
+});
+
+test('rejects a binary embedding source maps', () => {
+    const dist = writeDist({ 'assets/static/main.0783a71b.js': 'console.log("ok")' });
+    const binary = writeBinary('main.0783a71b.js plus main.0783a71b.js.map');
+    assert.throws(() => verifyEmbeddedBundles(binary, dist), /source maps/);
+    fs.rmSync(dist, { recursive: true });
+    fs.rmSync(path.dirname(binary), { recursive: true });
+});
+
+test('rejects a missing binary', () => {
+    const dist = writeDist({ 'assets/static/main.0783a71b.js': 'console.log("ok")' });
+    const binary = path.join(os.tmpdir(), `helper-binary-missing-${process.pid}`);
+    assert.throws(() => verifyEmbeddedBundles(binary, dist), /binary missing/);
+    fs.rmSync(dist, { recursive: true });
 });
