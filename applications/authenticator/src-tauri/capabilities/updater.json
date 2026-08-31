@@ -1,0 +1,7 @@
+{
+    "identifier": "updater-capability",
+    "description": "Fork-local divergence: the updater is scoped away from Linux, where the plugin is not registered and update checks are disabled",
+    "platforms": ["macOS", "windows"],
+    "windows": ["main"],
+    "permissions": ["updater:default"]
+}

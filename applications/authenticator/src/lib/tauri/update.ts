@@ -34,6 +34,15 @@ export const getLocalUpdateDistribution = () => {
 };
 
 export async function checkForUpdates(): Promise<Maybe<Update>> {
+    /** Fork-local divergence: this build is maintained locally and must never be
+     * replaced by an upstream binary. Skipping the check on Linux also stops the
+     * launch-time beacon to proton.me, which otherwise reports the running
+     * version alongside the persistent random `updateDistribution` identifier. */
+    if (runtime.platform === 'linux') {
+        logger.info('[Tauri::update] Updates disabled for this build');
+        return;
+    }
+
     logger.info('[Tauri::update] Checking for updates...');
 
     if (!runtime.platform) {
@@ -77,6 +86,13 @@ export async function checkForUpdates(): Promise<Maybe<Update>> {
 }
 
 export async function updateTo(updatePackage: Update) {
+    /** Fork-local divergence: see `checkForUpdates`. Guarded independently so
+     * the install path stays closed even if an update package reaches it. */
+    if (runtime.platform === 'linux') {
+        logger.info('[Tauri::update] Updates disabled for this build');
+        return;
+    }
+
     logger.info(`[Tauri::update] Updating to ${updatePackage.version}...`);
 
     try {

@@ -134,7 +134,7 @@ pub fn run() {
         initial_helper_mode.1,
     ));
 
-    app_builder
+    let app_builder = app_builder
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             let version = app.package_info().version.to_string();
@@ -197,8 +197,16 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_window_state::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init());
+
+    // Fork-local divergence: the Linux build is maintained locally and must
+    // never be replaced by an upstream binary, so the updater plugin is not
+    // registered there. The `updater` pubkey stays in `tauri.conf.json` as a
+    // trust anchor for verifying official builds.
+    #[cfg(not(target_os = "linux"))]
+    let app_builder = app_builder.plugin(tauri_plugin_updater::Builder::new().build());
+
+    app_builder
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             let login_requested = args.iter().any(|arg| arg == "--login");
             #[cfg(target_os = "linux")]
