@@ -8,5 +8,6 @@
             "esModuleInterop": true
         },
         "ignore": ["node_modules/(?!@proton)"]
-    }
+    },
+    "exclude": ["./src-tauri/target/**"]
 }

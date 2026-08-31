@@ -8,11 +8,11 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u8 = 1;
 const MAX_REQUEST_BYTES: u64 = 16 * 1024;
@@ -21,9 +21,7 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CLIPBOARD_TTL: Duration = Duration::from_secs(20);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONNECTIONS: usize = 16;
-const MAX_CLIPBOARD_BYTES: u64 = 64;
 const WL_COPY: &str = "/usr/bin/wl-copy";
-const WL_PASTE: &str = "/usr/bin/wl-paste";
 
 #[derive(Clone, Debug, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -65,12 +63,42 @@ impl Default for HelperSnapshot {
     }
 }
 
+trait ClipboardProcess: Send {
+    fn terminate(&mut self);
+}
+
+impl ClipboardProcess for Child {
+    fn terminate(&mut self) {
+        let _ = self.kill();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match self.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if Instant::now() >= deadline => return,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+}
+
+struct ClipboardOwner {
+    generation: u64,
+    process: Box<dyn ClipboardProcess>,
+}
+
+impl Drop for ClipboardOwner {
+    fn drop(&mut self) {
+        self.process.terminate();
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct HelperState {
     snapshot: Arc<RwLock<HelperSnapshot>>,
     manual_locked: Arc<AtomicBool>,
     login_requested: Arc<AtomicBool>,
     clipboard_generation: Arc<AtomicU64>,
+    clipboard_owner: Arc<Mutex<Option<ClipboardOwner>>>,
 }
 
 impl HelperState {
@@ -95,8 +123,38 @@ impl HelperState {
             .saturating_add(1)
     }
 
-    fn is_current_clipboard_generation(&self, generation: u64) -> bool {
-        self.clipboard_generation.load(Ordering::Acquire) == generation
+    fn replace_clipboard_owner(&self, process: Box<dyn ClipboardProcess>) -> u64 {
+        let generation = self.next_clipboard_generation();
+        let mut owner = self
+            .clipboard_owner
+            .lock()
+            .expect("clipboard lock poisoned");
+        *owner = Some(ClipboardOwner {
+            generation,
+            process,
+        });
+        generation
+    }
+
+    fn expire_clipboard_owner(&self, generation: u64) {
+        let mut owner = self
+            .clipboard_owner
+            .lock()
+            .expect("clipboard lock poisoned");
+        if owner
+            .as_ref()
+            .is_some_and(|current| current.generation == generation)
+        {
+            owner.take();
+        }
+    }
+
+    fn clear_clipboard_owner(&self) {
+        self.clipboard_generation.fetch_add(1, Ordering::AcqRel);
+        self.clipboard_owner
+            .lock()
+            .expect("clipboard lock poisoned")
+            .take();
     }
 
     fn publish(&self, mut snapshot: HelperSnapshot) -> Result<(), String> {
@@ -315,54 +373,36 @@ fn snapshot_response(id: &str, snapshot: &HelperSnapshot) -> Value {
     envelope(id, body)
 }
 
-fn read_clipboard_bounded() -> io::Result<Option<Vec<u8>>> {
-    let mut child = Command::new(WL_PASTE)
-        .arg("--no-newline")
-        .stdout(Stdio::piped())
+fn copy_to_clipboard(state: &HelperState, code: &str) -> io::Result<()> {
+    let mut child = Command::new(WL_COPY)
+        .args(["--foreground", "--sensitive"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let mut bytes = Vec::new();
-    child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "clipboard stdout unavailable"))?
-        .take(MAX_CLIPBOARD_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_CLIPBOARD_BYTES {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Ok(None);
-    }
-    if !child.wait()?.success() {
-        return Ok(None);
-    }
-    Ok(Some(bytes))
-}
-
-fn copy_to_clipboard(state: &HelperState, code: &str) -> io::Result<()> {
-    let mut child = Command::new(WL_COPY).stdin(Stdio::piped()).spawn()?;
-    child
+    let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "clipboard stdin unavailable"))?
-        .write_all(code.as_bytes())?;
-    if !child.wait()?.success() {
-        return Err(io::Error::other("wl-copy failed"));
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "clipboard stdin unavailable"))?;
+    if let Err(error) = stdin.write_all(code.as_bytes()) {
+        child.terminate();
+        return Err(error);
+    }
+    drop(stdin);
+    match child.try_wait() {
+        Ok(None) => {}
+        Ok(Some(_)) => return Err(io::Error::other("wl-copy exited before owning clipboard")),
+        Err(error) => {
+            child.terminate();
+            return Err(error);
+        }
     }
 
-    let expiration = state.next_clipboard_generation();
+    let expiration = state.replace_clipboard_owner(Box::new(child));
     let state = state.clone();
-    let code = code.as_bytes().to_vec();
     thread::spawn(move || {
         thread::sleep(CLIPBOARD_TTL);
-        if !state.is_current_clipboard_generation(expiration) {
-            return;
-        }
-        if let Ok(Some(current)) = read_clipboard_bounded() {
-            if current == code && state.is_current_clipboard_generation(expiration) {
-                let _ = Command::new(WL_COPY).arg("--clear").status();
-            }
-        }
+        state.expire_clipboard_owner(expiration);
     });
     Ok(())
 }
@@ -431,6 +471,7 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
         "lock" => {
             let mut snapshot = state.snapshot.write().expect("snapshot lock poisoned");
             state.manual_locked.store(true, Ordering::Release);
+            state.clear_clipboard_owner();
             snapshot.locked = true;
             snapshot.state = "locked".into();
             snapshot.entries.clear();
@@ -531,6 +572,14 @@ pub fn start_socket_server(state: HelperState) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    struct FakeClipboardProcess(Arc<AtomicBool>);
+
+    impl ClipboardProcess for FakeClipboardProcess {
+        fn terminate(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     fn valid_snapshot() -> HelperSnapshot {
         HelperSnapshot {
             state: "ready".into(),
@@ -562,12 +611,33 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_generation_renews_expiration() {
+    fn clipboard_ownership_replacement_and_expiry_are_generation_safe() {
         let state = HelperState::default();
-        let first = state.next_clipboard_generation();
-        let second = state.next_clipboard_generation();
-        assert!(!state.is_current_clipboard_generation(first));
-        assert!(state.is_current_clipboard_generation(second));
+        let first_stopped = Arc::new(AtomicBool::new(false));
+        let second_stopped = Arc::new(AtomicBool::new(false));
+        let first =
+            state.replace_clipboard_owner(Box::new(FakeClipboardProcess(first_stopped.clone())));
+        let second =
+            state.replace_clipboard_owner(Box::new(FakeClipboardProcess(second_stopped.clone())));
+        assert!(first_stopped.load(Ordering::Acquire));
+        assert!(!second_stopped.load(Ordering::Acquire));
+        state.expire_clipboard_owner(first);
+        assert!(!second_stopped.load(Ordering::Acquire));
+        state.expire_clipboard_owner(second);
+        assert!(second_stopped.load(Ordering::Acquire));
+
+        let lock_stopped = Arc::new(AtomicBool::new(false));
+        state.replace_clipboard_owner(Box::new(FakeClipboardProcess(lock_stopped.clone())));
+        let _ = handle_request(
+            &state,
+            HelperRequest {
+                v: 1,
+                id: "lock-owner".into(),
+                op: "lock".into(),
+                item_id: None,
+            },
+        );
+        assert!(lock_stopped.load(Ordering::Acquire));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 {
     "name": "proton-authenticator",
     "scripts": {
-        "build:desktop": "cross-env NODE_ENV=production API_ENV=proton.me tools/build.sh",
+        "build:desktop": "cross-env QA_BUILD=false NODE_ENV=production API_ENV=proton.me tools/build.sh",
+        "build:omarchy-helper": "cross-env NODE_ENV=production API_ENV=proton.me tools/build-omarchy-helper.sh",
         "build:web": "cross-env NODE_ENV=production API_ENV=proton.me webpack --config webpack.config.ts",
         "check-types": "tsc",
         "fmt:native": "cd src-tauri && make fmt",
@@ -17,6 +18,7 @@
         "start:desktop": "tauri dev --features devtools",
         "start:web": "cross-env API_ENV=proton.black webpack serve --config webpack.config.ts",
         "test": "jest",
+        "test:omarchy-helper-build": "node --test tools/verify-omarchy-helper-build.spec.mjs",
         "test:ci": "jest --coverage --runInBand --ci --passWithNoTests"
     },
     "dependencies": {
