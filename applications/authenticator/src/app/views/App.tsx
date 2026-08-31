@@ -1,5 +1,6 @@
 import { type FC, useState } from 'react';
 
+import { HelperLoginBridge } from 'proton-authenticator/app/components/HelperLoginBridge';
 import { ItemAdd } from 'proton-authenticator/app/components/Items/ItemAdd';
 import { Navbar } from 'proton-authenticator/app/components/Layout/Navbar';
 import { Settings } from 'proton-authenticator/app/views/SettingsScreen';
@@ -24,6 +25,7 @@ export const App: FC = () => {
             />
 
             <Items search={search} handleNewClick={handleNewClick} />
+            <HelperLoginBridge />
 
             {dialogOpen && <ItemAdd onClose={() => setDialogOpen(false)} />}
             {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} />}

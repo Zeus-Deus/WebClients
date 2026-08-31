@@ -4,6 +4,31 @@ import type { Item } from '../db/entities/items';
 import { toWasmEntry } from '../entries/items';
 import { service } from '../wasm/service';
 
+const INVALID_TEXT = /[\u0000-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/gu;
+const VALID_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const encoder = new TextEncoder();
+
+export type HelperState = 'ready' | 'locked' | 'needs_login' | 'unavailable' | 'error';
+
+export const shouldEnableHelper = (isTauri: boolean, platformIsLinux: boolean, userAgent: string): boolean =>
+    isTauri && (platformIsLinux || /\blinux\b/i.test(userAgent));
+
+export const shouldQueryHelperItems = (enabled: boolean, status: AppStatus, databaseOpen: boolean): boolean =>
+    enabled && status === 'ready' && databaseOpen;
+
+export const sanitizeHelperText = (value: string, maxBytes: number): string => {
+    const cleaned = String(value ?? '').replace(INVALID_TEXT, '').trim();
+    let result = '';
+    let bytes = 0;
+    for (const character of cleaned) {
+        const size = encoder.encode(character).byteLength;
+        if (bytes + size > maxBytes) break;
+        result += character;
+        bytes += size;
+    }
+    return result;
+};
+
 export type HelperEntry = {
     id: string;
     name: string;
@@ -16,7 +41,7 @@ export type HelperEntry = {
 };
 
 export type HelperSnapshot = {
-    state: 'ready' | 'locked' | 'needs_login' | 'unavailable' | 'error';
+    state: HelperState;
     locked: boolean;
     synced: boolean;
     account: string;
@@ -47,34 +72,38 @@ export const buildHelperSnapshot = ({
     account,
     generation,
     now,
-    generateCode = service.generate_code,
+    generateCode,
 }: SnapshotInput): HelperSnapshot => {
     const locked = status === 'locked';
+    const synced = syncState !== 'off';
+    const safeAccount = sanitizeHelperText(account, 120);
     if (status !== 'ready') {
         return {
             state: locked ? 'locked' : 'unavailable',
             locked,
-            synced: syncState === 'on',
-            account,
+            synced,
+            account: safeAccount,
             generation,
             now,
             entries: [],
         };
     }
 
+    const codeGenerator = generateCode ?? service.generate_code;
     const entries = items
         .filter((item) => item.syncMetadata?.state !== 'PendingToDelete')
         .sort((a, b) => a.order - b.order)
         .slice(0, 200)
         .flatMap((item): HelperEntry[] => {
             try {
-                const codes = generateCode(toWasmEntry(item), BigInt(now));
+                if (!VALID_ID.test(item.id) || !['Totp', 'Steam'].includes(item.entryType)) return [];
+                const codes = codeGenerator(toWasmEntry(item), BigInt(now));
                 const period = Math.max(15, Math.min(120, Math.floor(item.period || 30)));
                 return [
                     {
                         id: item.id,
-                        name: item.name,
-                        issuer: item.issuer,
+                        name: sanitizeHelperText(item.name, 80),
+                        issuer: sanitizeHelperText(item.issuer, 80),
                         type: item.entryType,
                         code: codes.current_code,
                         nextCode: codes.next_code,
@@ -90,8 +119,8 @@ export const buildHelperSnapshot = ({
     return {
         state: 'ready',
         locked: false,
-        synced: syncState === 'on',
-        account,
+        synced,
+        account: safeAccount,
         generation,
         now,
         entries,
