@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { verifyLatestFingerprint } from './verify-omarchy-helper-build.mjs';
+import { verifyDistBundle, verifyLatestFingerprint } from './verify-omarchy-helper-build.mjs';
 
 function writeFingerprint(root, name, features, mtimeMs) {
     const dir = path.join(root, name);
@@ -30,4 +30,51 @@ test('rejects the newest fingerprint when devtools is present', () => {
     writeFingerprint(root, 'proton-authenticator-new', ['devtools'], 2_000);
     assert.throws(() => verifyLatestFingerprint(root), /devtools/);
     fs.rmSync(root, { recursive: true });
+});
+
+function writeDist(files) {
+    const dist = fs.mkdtempSync(path.join(os.tmpdir(), 'helper-dist-'));
+    for (const [name, contents] of Object.entries(files)) {
+        const file = path.join(dist, name);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, contents);
+    }
+    return dist;
+}
+
+test('accepts a bundle without source maps or QA hooks', () => {
+    const dist = writeDist({
+        'index.html': '<html></html>',
+        'assets/static/main.js': 'console.log("ok")',
+    });
+    assert.equal(verifyDistBundle(dist), 1);
+    fs.rmSync(dist, { recursive: true });
+});
+
+test('rejects a bundle shipping source maps', () => {
+    const dist = writeDist({
+        'assets/static/main.js': 'console.log("ok")',
+        'assets/static/main.js.map': '{"version":3}',
+    });
+    assert.throws(() => verifyDistBundle(dist), /source maps/);
+    fs.rmSync(dist, { recursive: true });
+});
+
+test('rejects a bundle shipping QA hooks', () => {
+    const dist = writeDist({
+        'assets/static/main.js': 'window["qa::keyring::suppress"]=1',
+    });
+    assert.throws(() => verifyDistBundle(dist), /QA hooks/);
+    fs.rmSync(dist, { recursive: true });
+});
+
+test('rejects a bundle with no scripts at all', () => {
+    const dist = writeDist({ 'index.html': '<html></html>' });
+    assert.throws(() => verifyDistBundle(dist), /no scripts/);
+    fs.rmSync(dist, { recursive: true });
+});
+
+test('rejects a missing bundle directory', () => {
+    const dist = path.join(os.tmpdir(), `helper-dist-missing-${process.pid}`);
+    assert.throws(() => verifyDistBundle(dist), /bundle missing/);
 });
