@@ -19,6 +19,12 @@ const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CLIPBOARD_TTL: Duration = Duration::from_secs(20);
+// Codes expire with their TOTP period, and the publisher lives in a webview
+// that `--background` keeps hidden, where timers are throttled. A stalled
+// publisher would otherwise leave its last snapshot on the socket long after
+// those codes stopped being valid, so anything older than this is served as if
+// nothing had been published at all.
+const SNAPSHOT_TTL: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONNECTIONS: usize = 16;
 const WL_COPY: &str = "/usr/bin/wl-copy";
@@ -95,6 +101,7 @@ impl Drop for ClipboardOwner {
 #[derive(Clone, Default)]
 pub struct HelperState {
     snapshot: Arc<RwLock<HelperSnapshot>>,
+    published_at: Arc<Mutex<Option<Instant>>>,
     manual_locked: Arc<AtomicBool>,
     login_requested: Arc<AtomicBool>,
     clipboard_generation: Arc<AtomicU64>,
@@ -174,7 +181,36 @@ impl HelperState {
             return Err("snapshot_too_large".into());
         }
         *current = snapshot;
+        *self.published_at.lock().expect("publication lock poisoned") = Some(Instant::now());
         Ok(())
+    }
+
+    // A snapshot whose publisher has stalled is served as if nothing had been
+    // published. Only `ready` carries codes, so staleness degrades that state to
+    // `unavailable` and drops the rows; states such as `locked` or `needs_login`
+    // carry none and stay true until the app republishes.
+    fn current_snapshot(&self) -> (HelperSnapshot, bool) {
+        let snapshot = self
+            .snapshot
+            .read()
+            .expect("snapshot lock poisoned")
+            .clone();
+        let fresh = self
+            .published_at
+            .lock()
+            .expect("publication lock poisoned")
+            .is_some_and(|published| published.elapsed() < SNAPSHOT_TTL);
+        if fresh || snapshot.state != "ready" {
+            return (snapshot, false);
+        }
+        (
+            HelperSnapshot {
+                state: "unavailable".into(),
+                entries: Vec::new(),
+                ..snapshot
+            },
+            true,
+        )
     }
 
     /// Clears the manual lock latch and drops the published snapshot.
@@ -372,10 +408,11 @@ fn envelope(id: &str, body: Value) -> Value {
     Value::Object(map)
 }
 
-fn snapshot_response(id: &str, snapshot: &HelperSnapshot) -> Value {
+fn snapshot_response(id: &str, snapshot: &HelperSnapshot, stale: bool) -> Value {
     let mut body = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({ "state": "error" }));
     if let Value::Object(map) = &mut body {
         map.insert("ok".into(), json!(true));
+        map.insert("stale".into(), json!(stale));
     }
     envelope(id, body)
 }
@@ -424,11 +461,7 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
 
     match request.op.as_str() {
         "status" => {
-            let snapshot = state
-                .snapshot
-                .read()
-                .expect("snapshot lock poisoned")
-                .clone();
+            let (snapshot, stale) = state.current_snapshot();
             envelope(
                 &request.id,
                 json!({
@@ -439,16 +472,13 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
                     "account": snapshot.account,
                     "generation": snapshot.generation,
                     "count": snapshot.entries.len(),
+                    "stale": stale,
                 }),
             )
         }
         "snapshot" => {
-            let snapshot = state
-                .snapshot
-                .read()
-                .expect("snapshot lock poisoned")
-                .clone();
-            snapshot_response(&request.id, &snapshot)
+            let (snapshot, stale) = state.current_snapshot();
+            snapshot_response(&request.id, &snapshot, stale)
         }
         "copy" => {
             let Some(item_id) = request.item_id.filter(|id| valid_id(id)) else {
@@ -457,7 +487,10 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
                     json!({ "ok": false, "error": "invalid_item_id" }),
                 );
             };
-            let snapshot = state.snapshot.read().expect("snapshot lock poisoned");
+            let (snapshot, stale) = state.current_snapshot();
+            if stale {
+                return envelope(&request.id, json!({ "ok": false, "error": "stale" }));
+            }
             if snapshot.locked || snapshot.state != "ready" {
                 return envelope(&request.id, json!({ "ok": false, "error": "locked" }));
             }
@@ -596,6 +629,11 @@ mod tests {
                 valid_until: 60,
             }],
         }
+    }
+
+    fn backdate_publication(state: &HelperState, age: Duration) {
+        let mut published = state.published_at.lock().unwrap();
+        *published = published.map(|instant| instant - age);
     }
 
     #[test]
@@ -739,10 +777,118 @@ mod tests {
 
         state.unlock();
         state.publish(republished).unwrap();
-        let snapshot = state.snapshot.read().unwrap();
-        assert!(!snapshot.locked);
-        assert_eq!(snapshot.state, "ready");
-        assert_eq!(snapshot.entries.len(), 1);
-        assert_eq!(snapshot.generation, 4);
+        {
+            let snapshot = state.snapshot.read().unwrap();
+            assert!(!snapshot.locked);
+            assert_eq!(snapshot.state, "ready");
+            assert_eq!(snapshot.entries.len(), 1);
+            assert_eq!(snapshot.generation, 4);
+        }
+    }
+
+    #[test]
+    fn stale_ready_snapshot_is_served_as_unavailable() {
+        let state = HelperState::default();
+        state.publish(valid_snapshot()).unwrap();
+
+        let (fresh, stale) = state.current_snapshot();
+        assert!(!stale);
+        assert_eq!(fresh.state, "ready");
+        assert_eq!(fresh.entries.len(), 1);
+
+        backdate_publication(&state, SNAPSHOT_TTL + Duration::from_secs(1));
+        let (expired, stale) = state.current_snapshot();
+        assert!(stale);
+        assert_eq!(expired.state, "unavailable");
+        assert!(expired.entries.is_empty());
+        // the underlying snapshot is untouched, so a republish recovers instantly
+        assert_eq!(state.snapshot.read().unwrap().entries.len(), 1);
+        state.publish(valid_snapshot()).unwrap();
+        assert!(!state.current_snapshot().1);
+    }
+
+    #[test]
+    fn snapshot_op_reports_staleness_and_withholds_codes() {
+        let state = HelperState::default();
+        state.publish(valid_snapshot()).unwrap();
+        backdate_publication(&state, SNAPSHOT_TTL + Duration::from_secs(1));
+
+        let response = handle_request(
+            &state,
+            HelperRequest {
+                v: 1,
+                id: "stale-snapshot".into(),
+                op: "snapshot".into(),
+                item_id: None,
+            },
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["stale"], true);
+        assert_eq!(response["state"], "unavailable");
+        assert_eq!(response["entries"].as_array().unwrap().len(), 0);
+
+        let status = handle_request(
+            &state,
+            HelperRequest {
+                v: 1,
+                id: "stale-status".into(),
+                op: "status".into(),
+                item_id: None,
+            },
+        );
+        assert_eq!(status["stale"], true);
+        assert_eq!(status["state"], "unavailable");
+        assert_eq!(status["count"], 0);
+    }
+
+    #[test]
+    fn copy_refuses_a_stale_snapshot() {
+        let state = HelperState::default();
+        state.publish(valid_snapshot()).unwrap();
+        backdate_publication(&state, SNAPSHOT_TTL + Duration::from_secs(1));
+
+        let response = handle_request(
+            &state,
+            HelperRequest {
+                v: 1,
+                id: "stale-copy".into(),
+                op: "copy".into(),
+                item_id: Some("fixture-rfc6238".into()),
+            },
+        );
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"], "stale");
+    }
+
+    #[test]
+    fn never_published_state_is_not_reported_as_ready() {
+        let state = HelperState::default();
+        let (snapshot, stale) = state.current_snapshot();
+        assert!(!stale);
+        assert_eq!(snapshot.state, "unavailable");
+
+        // a snapshot forced into the lock without going through `publish` has no
+        // publication instant, so it must not be served as live
+        *state.snapshot.write().unwrap() = valid_snapshot();
+        let (snapshot, stale) = state.current_snapshot();
+        assert!(stale);
+        assert_eq!(snapshot.state, "unavailable");
+        assert!(snapshot.entries.is_empty());
+    }
+
+    #[test]
+    fn stale_non_ready_states_are_preserved() {
+        let state = HelperState::default();
+        let mut locked = valid_snapshot();
+        locked.state = "locked".into();
+        locked.locked = true;
+        locked.entries.clear();
+        state.publish(locked).unwrap();
+        backdate_publication(&state, SNAPSHOT_TTL + Duration::from_secs(1));
+
+        let (snapshot, stale) = state.current_snapshot();
+        assert!(!stale);
+        assert_eq!(snapshot.state, "locked");
+        assert!(snapshot.locked);
     }
 }
