@@ -212,7 +212,9 @@ pub fn run() {
             #[cfg(target_os = "linux")]
             if login_requested {
                 let state = app.state::<helper::HelperState>();
-                state.unlock();
+                // Login does not need an unlocked snapshot. Calling `unlock` here
+                // would let any same-uid process clear the manual lock latch just
+                // by running the binary with `--login`.
                 state.request_login();
                 let _ = app.emit_to("main", "omarchy-helper:login", ());
             }
