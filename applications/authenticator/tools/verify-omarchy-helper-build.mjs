@@ -84,14 +84,34 @@ export function verifyEmbeddedBundles(binary, dist) {
     return embedded.size;
 }
 
+/** build.rs embeds the source commit as a string constant that the `status`
+ * socket op reports. Requiring it here ties the artifact to the checkout that
+ * produced it: a binary built from another commit, or from a dirty tree, is
+ * rejected before it can be installed. */
+export function verifyEmbeddedCommit(binary, commit) {
+    if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error(`invalid source commit: ${commit}`);
+    const contents = fs.readFileSync(binary, 'latin1');
+    if (contents.includes(`${commit}-dirty`)) {
+        throw new Error(`refusing helper binary built from a dirty tree at ${commit}`);
+    }
+    if (!contents.includes(commit)) {
+        throw new Error(`helper binary does not embed source commit ${commit}`);
+    }
+    return commit;
+}
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-    const [root, dist, binary] = process.argv.slice(2);
-    if (!root || !dist) throw new Error('usage: verify-omarchy-helper-build.mjs <fingerprint-root> <dist> [binary]');
+    const [root, dist, binary, commit] = process.argv.slice(2);
+    if (!root || !dist) {
+        throw new Error('usage: verify-omarchy-helper-build.mjs <fingerprint-root> <dist> [binary [commit]]');
+    }
     process.stdout.write(`${verifyLatestFingerprint(path.resolve(root))}\n`);
     process.stdout.write(`${verifyDistBundle(path.resolve(dist))} bundle scripts verified\n`);
     if (binary) {
         const embedded = verifyEmbeddedBundles(path.resolve(binary), path.resolve(dist));
         process.stdout.write(`${embedded} embedded bundle(s) verified\n`);
+    }
+    if (binary && commit) {
+        process.stdout.write(`embedded source commit ${verifyEmbeddedCommit(path.resolve(binary), commit)}\n`);
     }
 }
