@@ -513,6 +513,7 @@ fn snapshot_response(id: &str, snapshot: &HelperSnapshot, stale: bool, instance:
         map.insert("ok".into(), json!(true));
         map.insert("stale".into(), json!(stale));
         map.insert("instance".into(), json!(instance));
+        map.insert("sourceCommit".into(), json!(SOURCE_COMMIT));
     }
     envelope(id, body)
 }
