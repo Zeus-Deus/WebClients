@@ -50,16 +50,52 @@ where
 
 #[cfg(target_os = "linux")]
 fn helper_log_level(background: bool) -> log::LevelFilter {
+    // The upstream Debug level logs entry ids, keyring lookups, and serialized
+    // errors, which the background helper must not persist. Warn keeps socket
+    // setup failures and clipboard errors visible in the journal without any of
+    // that detail.
     if background {
-        log::LevelFilter::Off
+        log::LevelFilter::Warn
     } else {
         log::LevelFilter::Debug
     }
 }
 
+/// What a forwarded single-instance invocation is allowed to do. The callback
+/// is reachable over the session bus by any same-uid client with arbitrary
+/// argv, so only one exact flag is honoured and everything else is ignored:
+/// `--login` surfaces Proton's own sign-in modal; a bare relaunch (the user
+/// clicking the desktop entry) surfaces the window; anything else does nothing.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum ForwardedAction {
+    ShowWindow,
+    Login,
+    Ignore,
+}
+
+#[cfg(target_os = "linux")]
+fn forwarded_action<I, S>(args: I) -> ForwardedAction
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut flags: Vec<String> = args
+        .into_iter()
+        .skip(1)
+        .map(|argument| argument.as_ref().to_string())
+        .collect();
+    flags.retain(|flag| flag != "--background");
+    match flags.as_slice() {
+        [] => ForwardedAction::ShowWindow,
+        [flag] if flag == "--login" => ForwardedAction::Login,
+        _ => ForwardedAction::Ignore,
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{helper_log_level, helper_window_mode};
+    use super::{forwarded_action, helper_log_level, helper_window_mode, ForwardedAction};
 
     #[test]
     fn helper_window_mode_hides_background_except_login() {
@@ -72,9 +108,36 @@ mod tests {
     }
 
     #[test]
-    fn background_helper_disables_application_logging() {
-        assert_eq!(helper_log_level(true), log::LevelFilter::Off);
+    fn background_helper_keeps_only_warnings_and_errors() {
+        assert_eq!(helper_log_level(true), log::LevelFilter::Warn);
         assert_eq!(helper_log_level(false), log::LevelFilter::Debug);
+    }
+
+    #[test]
+    fn forwarded_invocations_honour_exactly_one_flag() {
+        assert_eq!(forwarded_action(["app"]), ForwardedAction::ShowWindow);
+        assert_eq!(
+            forwarded_action(["app", "--background"]),
+            ForwardedAction::ShowWindow
+        );
+        assert_eq!(forwarded_action(["app", "--login"]), ForwardedAction::Login);
+        assert_eq!(
+            forwarded_action(["app", "--background", "--login"]),
+            ForwardedAction::Login
+        );
+        // Arbitrary argv from a D-Bus caller must not be treated as a relaunch.
+        assert_eq!(
+            forwarded_action(["app", "--login", "--login"]),
+            ForwardedAction::Ignore
+        );
+        assert_eq!(
+            forwarded_action(["app", "--unlock"]),
+            ForwardedAction::Ignore
+        );
+        assert_eq!(
+            forwarded_action(["app", "/some/file.json"]),
+            ForwardedAction::Ignore
+        );
     }
 }
 
@@ -178,7 +241,12 @@ pub fn run() {
             }
 
             #[cfg(target_os = "linux")]
-            helper::start_socket_server(app.state::<helper::HelperState>().inner().clone())?;
+            {
+                let socket_path = helper::start_socket_server(
+                    app.state::<helper::HelperState>().inner().clone(),
+                )?;
+                app.manage(helper::SocketPath(socket_path));
+            }
 
             Ok(())
         })
@@ -208,16 +276,23 @@ pub fn run() {
 
     app_builder
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            let login_requested = args.iter().any(|arg| arg == "--login");
+            // Forwarded argv arrives over the session bus from any same-uid
+            // client, so it is treated as a request, not a command line.
             #[cfg(target_os = "linux")]
-            if login_requested {
-                let state = app.state::<helper::HelperState>();
-                // Login does not need an unlocked snapshot. Calling `unlock` here
-                // would let any same-uid process clear the manual lock latch just
-                // by running the binary with `--login`.
-                state.request_login();
-                let _ = app.emit_to("main", "omarchy-helper:login", ());
+            match forwarded_action(args.iter()) {
+                ForwardedAction::Ignore => return,
+                ForwardedAction::Login => {
+                    let state = app.state::<helper::HelperState>();
+                    // Login does not need an unlocked snapshot. Calling `unlock`
+                    // here would let any same-uid process clear the manual lock
+                    // latch just by running the binary with `--login`.
+                    state.request_login();
+                    let _ = app.emit_to("main", "omarchy-helper:login", ());
+                }
+                ForwardedAction::ShowWindow => {}
             }
+            #[cfg(not(target_os = "linux"))]
+            let _ = args;
             let _ = app.get_webview_window("main").and_then(|window| {
                 let _ = window.show();
                 let _ = window.unminimize();
@@ -229,6 +304,18 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_http::init())
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Unlink the private socket on exit so the next start does not find
+            // a stale node in its path check.
+            #[cfg(target_os = "linux")]
+            if let tauri::RunEvent::Exit = event {
+                if let Some(path) = app.try_state::<helper::SocketPath>() {
+                    helper::remove_socket(&path.0);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = (app, event);
+        });
 }

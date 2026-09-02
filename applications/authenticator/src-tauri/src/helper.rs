@@ -26,8 +26,19 @@ const CLIPBOARD_TTL: Duration = Duration::from_secs(20);
 // nothing had been published at all.
 const SNAPSHOT_TTL: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+// One request/response exchange is a few kilobytes; anything that takes longer
+// than this end to end is a client dripping bytes to hold a connection slot.
+const CLIENT_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 16;
 const WL_COPY: &str = "/usr/bin/wl-copy";
+// How long the clipboard child gets to prove it took ownership. wl-copy in
+// foreground mode exits immediately if it cannot connect to the compositor or
+// another client refuses the offer; a child still alive after this window
+// has bound the selection.
+const CLIPBOARD_OWNERSHIP_GRACE: Duration = Duration::from_millis(150);
+// Source commit the binary was built from, embedded by build.rs so `status`
+// can identify the running artifact.
+const SOURCE_COMMIT: &str = env!("OMARCHY_HELPER_SOURCE_COMMIT");
 
 #[derive(Clone, Debug, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -106,13 +117,41 @@ pub struct HelperState {
     login_requested: Arc<AtomicBool>,
     clipboard_generation: Arc<AtomicU64>,
     clipboard_owner: Arc<Mutex<Option<ClipboardOwner>>>,
+    // Random per-process identifier. Generations restart at 1 with every
+    // helper process, so a client keeping a monotonic floor across a helper
+    // restart would reject every fresh snapshot until it caught up. Sending the
+    // instance lets the client reset its floor only when the process changed.
+    instance: Arc<str>,
+}
+
+fn new_instance_id() -> Arc<str> {
+    let mut bytes = [0u8; 16];
+    let mut file = fs::File::open("/dev/urandom").expect("urandom unavailable");
+    file.read_exact(&mut bytes).expect("urandom read failed");
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    hex.into()
 }
 
 impl HelperState {
+    pub fn new() -> Self {
+        Self {
+            instance: new_instance_id(),
+            ..Self::default()
+        }
+    }
+
     pub fn with_login_requested(login_requested: bool) -> Self {
         Self {
             login_requested: Arc::new(AtomicBool::new(login_requested)),
-            ..Self::default()
+            ..Self::new()
+        }
+    }
+
+    fn instance(&self) -> &str {
+        if self.instance.is_empty() {
+            "0"
+        } else {
+            &self.instance
         }
     }
 
@@ -130,38 +169,52 @@ impl HelperState {
             .saturating_add(1)
     }
 
+    // Every path that retires an owner takes it out from under the mutex and
+    // lets it drop afterwards: `terminate()` can block for up to 500 ms, and
+    // holding the clipboard lock across that stalls every concurrent copy and
+    // lock request behind one slow child.
     fn replace_clipboard_owner(&self, process: Box<dyn ClipboardProcess>) -> u64 {
         let generation = self.next_clipboard_generation();
-        let mut owner = self
-            .clipboard_owner
-            .lock()
-            .expect("clipboard lock poisoned");
-        *owner = Some(ClipboardOwner {
-            generation,
-            process,
-        });
+        let previous = {
+            let mut owner = self
+                .clipboard_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            owner.replace(ClipboardOwner {
+                generation,
+                process,
+            })
+        };
+        drop(previous);
         generation
     }
 
     fn expire_clipboard_owner(&self, generation: u64) {
-        let mut owner = self
-            .clipboard_owner
-            .lock()
-            .expect("clipboard lock poisoned");
-        if owner
-            .as_ref()
-            .is_some_and(|current| current.generation == generation)
-        {
-            owner.take();
-        }
+        let expired = {
+            let mut owner = self
+                .clipboard_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if owner
+                .as_ref()
+                .is_some_and(|current| current.generation == generation)
+            {
+                owner.take()
+            } else {
+                None
+            }
+        };
+        drop(expired);
     }
 
     fn clear_clipboard_owner(&self) {
         self.clipboard_generation.fetch_add(1, Ordering::AcqRel);
-        self.clipboard_owner
+        let cleared = self
+            .clipboard_owner
             .lock()
-            .expect("clipboard lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+        drop(cleared);
     }
 
     fn publish(&self, mut snapshot: HelperSnapshot) -> Result<(), String> {
@@ -169,7 +222,7 @@ impl HelperState {
         let mut current = self
             .snapshot
             .write()
-            .map_err(|_| "snapshot_lock".to_string())?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.manual_locked.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -181,7 +234,10 @@ impl HelperState {
             return Err("snapshot_too_large".into());
         }
         *current = snapshot;
-        *self.published_at.lock().expect("publication lock poisoned") = Some(Instant::now());
+        *self
+            .published_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
         Ok(())
     }
 
@@ -193,12 +249,12 @@ impl HelperState {
         let snapshot = self
             .snapshot
             .read()
-            .expect("snapshot lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let fresh = self
             .published_at
             .lock()
-            .expect("publication lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_some_and(|published| published.elapsed() < SNAPSHOT_TTL);
         if fresh || snapshot.state != "ready" {
             return (snapshot, false);
@@ -211,6 +267,26 @@ impl HelperState {
             },
             true,
         )
+    }
+
+    /// Latches the helper locked and clears everything it was serving. Returns
+    /// the new generation. The write guard is released before the clipboard
+    /// owner is terminated so a slow `wl-copy` cannot stall `publish`.
+    fn lock(&self) -> u64 {
+        let generation = {
+            let mut snapshot = self
+                .snapshot
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.manual_locked.store(true, Ordering::Release);
+            snapshot.locked = true;
+            snapshot.state = "locked".into();
+            snapshot.entries.clear();
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.generation
+        };
+        self.clear_clipboard_owner();
+        generation
     }
 
     /// Clears the manual lock latch and drops the published snapshot.
@@ -230,6 +306,10 @@ impl HelperState {
         }
     }
 }
+
+/// Path of the socket this process bound, kept in Tauri managed state so the
+/// exit hook can unlink exactly that node.
+pub struct SocketPath(pub PathBuf);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -370,9 +450,28 @@ fn prepare_socket(path: &Path) -> io::Result<UnixListener> {
         fs::remove_file(path)?;
     }
 
-    let listener = UnixListener::bind(path)?;
+    // `bind` creates the socket node with `0777 & ~umask`, and the systemd unit's
+    // UMask is not something an ad-hoc launch inherits. Force the umask for the
+    // bind itself so there is no window where the node is group/other-reachable
+    // before the explicit chmod below.
+    let previous_umask = unsafe { libc::umask(0o077) };
+    let bound = UnixListener::bind(path);
+    unsafe { libc::umask(previous_umask) };
+    let listener = bound?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+/// Removes the socket node this process created, if it is still ours. Called
+/// from the app exit hook; a stale node left behind would otherwise trip the
+/// next start's safety check when combined with a planted symlink.
+pub fn remove_socket(path: &Path) {
+    let uid = unsafe { libc::geteuid() };
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.uid() == uid && metadata.file_type().is_socket() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
@@ -408,11 +507,12 @@ fn envelope(id: &str, body: Value) -> Value {
     Value::Object(map)
 }
 
-fn snapshot_response(id: &str, snapshot: &HelperSnapshot, stale: bool) -> Value {
+fn snapshot_response(id: &str, snapshot: &HelperSnapshot, stale: bool, instance: &str) -> Value {
     let mut body = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({ "state": "error" }));
     if let Value::Object(map) = &mut body {
         map.insert("ok".into(), json!(true));
         map.insert("stale".into(), json!(stale));
+        map.insert("instance".into(), json!(instance));
     }
     envelope(id, body)
 }
@@ -433,21 +533,32 @@ fn copy_to_clipboard(state: &HelperState, code: &str) -> io::Result<()> {
         return Err(error);
     }
     drop(stdin);
-    match child.try_wait() {
-        Ok(None) => {}
-        Ok(Some(_)) => return Err(io::Error::other("wl-copy exited before owning clipboard")),
-        Err(error) => {
-            child.terminate();
-            return Err(error);
+    // A foreground wl-copy that fails to bind the selection exits at once. One
+    // immediate `try_wait` races that exit, so poll through a short grace period
+    // before reporting `copied: true` to the caller.
+    let deadline = Instant::now() + CLIPBOARD_OWNERSHIP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(None) if Instant::now() >= deadline => break,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Ok(Some(_)) => return Err(io::Error::other("wl-copy exited before owning clipboard")),
+            Err(error) => {
+                child.terminate();
+                return Err(error);
+            }
         }
     }
 
     let expiration = state.replace_clipboard_owner(Box::new(child));
     let state = state.clone();
-    thread::spawn(move || {
-        thread::sleep(CLIPBOARD_TTL);
-        state.expire_clipboard_owner(expiration);
-    });
+    // One sleeper per successful copy. It only touches the owner if its own
+    // generation is still current, so a replaced copy's sleeper is a no-op.
+    let _ = thread::Builder::new()
+        .name("omarchy-authenticator-clipboard-ttl".into())
+        .spawn(move || {
+            thread::sleep(CLIPBOARD_TTL);
+            state.expire_clipboard_owner(expiration);
+        });
     Ok(())
 }
 
@@ -460,6 +571,9 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
     }
 
     match request.op.as_str() {
+        // `status` deliberately omits the account: it is the only op a client
+        // is expected to call before deciding whether to trust the socket, so
+        // it must not disclose which Proton identity is signed in.
         "status" => {
             let (snapshot, stale) = state.current_snapshot();
             envelope(
@@ -469,8 +583,10 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
                     "state": snapshot.state,
                     "locked": snapshot.locked,
                     "synced": snapshot.synced,
-                    "account": snapshot.account,
+                    "signedIn": !snapshot.account.is_empty(),
                     "generation": snapshot.generation,
+                    "instance": state.instance(),
+                    "sourceCommit": SOURCE_COMMIT,
                     "count": snapshot.entries.len(),
                     "stale": stale,
                 }),
@@ -478,7 +594,7 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
         }
         "snapshot" => {
             let (snapshot, stale) = state.current_snapshot();
-            snapshot_response(&request.id, &snapshot, stale)
+            snapshot_response(&request.id, &snapshot, stale, state.instance())
         }
         "copy" => {
             let Some(item_id) = request.item_id.filter(|id| valid_id(id)) else {
@@ -509,16 +625,10 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
             }
         }
         "lock" => {
-            let mut snapshot = state.snapshot.write().expect("snapshot lock poisoned");
-            state.manual_locked.store(true, Ordering::Release);
-            state.clear_clipboard_owner();
-            snapshot.locked = true;
-            snapshot.state = "locked".into();
-            snapshot.entries.clear();
-            snapshot.generation = snapshot.generation.saturating_add(1);
+            let generation = state.lock();
             envelope(
                 &request.id,
-                json!({ "ok": true, "state": "locked", "locked": true, "generation": snapshot.generation }),
+                json!({ "ok": true, "state": "locked", "locked": true, "generation": generation, "instance": state.instance() }),
             )
         }
         // `unlock` is deliberately not exposed over the socket: the lock
@@ -531,8 +641,48 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
     }
 }
 
+/// Reads one newline-terminated request line with both a per-read timeout and
+/// a wall-clock deadline. `set_read_timeout` alone restarts on every byte, so a
+/// client dripping one byte per second could hold a connection slot forever.
+fn read_request_line(stream: &UnixStream, deadline: Instant) -> io::Result<String> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request deadline exceeded"))?;
+        stream.set_read_timeout(Some(remaining.min(CLIENT_TIMEOUT)))?;
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before newline",
+            ));
+        }
+        let (chunk, done) = match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (&buffer[..index], true),
+            None => (buffer, false),
+        };
+        if line.len() + chunk.len() > MAX_REQUEST_BYTES as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request too large",
+            ));
+        }
+        line.extend_from_slice(chunk);
+        let consumed = if done { chunk.len() + 1 } else { chunk.len() };
+        reader.consume(consumed);
+        if done {
+            break;
+        }
+    }
+    String::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "request is not utf-8"))
+}
+
 fn handle_client(state: HelperState, mut stream: UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
+    let deadline = Instant::now() + CLIENT_DEADLINE;
     stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
     if peer_uid(&stream)? != unsafe { libc::geteuid() } {
         return Err(io::Error::new(
@@ -541,15 +691,9 @@ fn handle_client(state: HelperState, mut stream: UnixStream) -> io::Result<()> {
         ));
     }
 
-    let mut line = String::new();
-    let read = BufReader::new(stream.try_clone()?)
-        .take(MAX_REQUEST_BYTES + 1)
-        .read_line(&mut line)?;
-    if read == 0 || read as u64 > MAX_REQUEST_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request too large",
-        ));
+    let line = read_request_line(&stream, deadline)?;
+    if line.trim().is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty request"));
     }
     let request: HelperRequest = serde_json::from_str(line.trim_end())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid json"))?;
@@ -558,6 +702,11 @@ fn handle_client(state: HelperState, mut stream: UnixStream) -> io::Result<()> {
     if encoded.len() > MAX_RESPONSE_BYTES {
         encoded = b"{\"v\":1,\"id\":\"\",\"ok\":false,\"error\":\"response_too_large\"}\n".to_vec();
     }
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request deadline exceeded"))?;
+    stream.set_write_timeout(Some(remaining.min(CLIENT_TIMEOUT)))?;
     stream.write_all(&encoded)
 }
 
@@ -890,5 +1039,170 @@ mod tests {
         assert!(!stale);
         assert_eq!(snapshot.state, "locked");
         assert!(snapshot.locked);
+    }
+
+    fn request(op: &str, item_id: Option<&str>) -> HelperRequest {
+        HelperRequest {
+            v: 1,
+            id: "req".into(),
+            op: op.into(),
+            item_id: item_id.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn every_process_gets_a_distinct_instance_that_all_ops_report() {
+        let first = HelperState::new();
+        let second = HelperState::new();
+        assert_eq!(first.instance().len(), 32);
+        assert_ne!(first.instance(), second.instance());
+        assert!(first.instance().bytes().all(|c| c.is_ascii_hexdigit()));
+
+        first.publish(valid_snapshot()).unwrap();
+        for op in ["status", "snapshot", "lock"] {
+            let response = handle_request(&first, request(op, None));
+            assert_eq!(response["ok"], true, "{op}");
+            assert_eq!(response["instance"], first.instance(), "{op}");
+        }
+        // A default-constructed state (tests) still reports a non-empty value.
+        assert_eq!(HelperState::default().instance(), "0");
+    }
+
+    #[test]
+    fn status_reports_provenance_and_sign_in_but_never_the_account() {
+        let state = HelperState::new();
+        state.publish(valid_snapshot()).unwrap();
+        let status = handle_request(&state, request("status", None));
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["signedIn"], true);
+        assert!(status.get("account").is_none());
+        assert_eq!(status["sourceCommit"], SOURCE_COMMIT);
+        assert!(!SOURCE_COMMIT.is_empty());
+        let text = status.to_string();
+        assert!(!text.contains("test@example.test"));
+        assert!(!text.contains("94287082"));
+    }
+
+    struct SlowClipboardProcess {
+        stopped: Arc<AtomicBool>,
+        delay: Duration,
+    }
+
+    impl ClipboardProcess for SlowClipboardProcess {
+        fn terminate(&mut self) {
+            thread::sleep(self.delay);
+            self.stopped.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn lock_does_not_hold_the_snapshot_lock_while_terminating_the_clipboard_owner() {
+        let state = HelperState::new();
+        state.publish(valid_snapshot()).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        state.replace_clipboard_owner(Box::new(SlowClipboardProcess {
+            stopped: stopped.clone(),
+            delay: Duration::from_millis(300),
+        }));
+
+        let locker = state.clone();
+        let handle = thread::spawn(move || locker.lock());
+        // Give `lock` time to enter the slow terminate.
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        let (snapshot, _) = state.current_snapshot();
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "snapshot read blocked behind clipboard termination"
+        );
+        assert!(snapshot.locked);
+        handle.join().unwrap();
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn replacing_an_owner_terminates_it_outside_the_clipboard_lock() {
+        let state = HelperState::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        state.replace_clipboard_owner(Box::new(SlowClipboardProcess {
+            stopped: stopped.clone(),
+            delay: Duration::from_millis(300),
+        }));
+        let replacer = state.clone();
+        let handle = thread::spawn(move || {
+            replacer.replace_clipboard_owner(Box::new(FakeClipboardProcess(Arc::new(
+                AtomicBool::new(false),
+            ))));
+        });
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        // A concurrent expiry must not queue behind the slow terminate.
+        state.expire_clipboard_owner(u64::MAX);
+        assert!(started.elapsed() < Duration::from_millis(150));
+        handle.join().unwrap();
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_dripping_client_is_cut_off_at_the_wall_clock_deadline() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let reader = thread::spawn(move || {
+            read_request_line(&server, Instant::now() + Duration::from_millis(600))
+        });
+        // Drip one byte every 100 ms: each read succeeds inside CLIENT_TIMEOUT,
+        // so only the wall-clock deadline can end this.
+        for _ in 0..20 {
+            if client.write_all(b"{").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let error = reader.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn oversized_and_well_formed_request_lines_are_handled() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let reader = thread::spawn(move || {
+            read_request_line(&server, Instant::now() + Duration::from_secs(2))
+        });
+        client.write_all(b"{\"v\":1}\nignored").unwrap();
+        assert_eq!(reader.join().unwrap().unwrap(), "{\"v\":1}");
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let reader = thread::spawn(move || {
+            read_request_line(&server, Instant::now() + Duration::from_secs(2))
+        });
+        let oversized = vec![b'a'; MAX_REQUEST_BYTES as usize + 1];
+        let _ = client.write_all(&oversized);
+        let error = reader.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn remove_socket_only_unlinks_an_owned_socket_node() {
+        let base = std::env::temp_dir().join(format!(
+            "proton-authenticator-helper-remove-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let regular = base.join("regular");
+        fs::write(&regular, b"x").unwrap();
+        remove_socket(&regular);
+        assert!(regular.exists(), "a regular file must not be unlinked");
+
+        let socket = base.join("helper.sock");
+        let listener = prepare_socket(&socket).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(listener);
+        remove_socket(&socket);
+        assert!(!socket.exists());
+        fs::remove_dir_all(&base).unwrap();
     }
 }
