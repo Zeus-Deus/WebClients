@@ -30,6 +30,22 @@ fn apply_webkitgtk_workaround() {
     }
 }
 
+/// Proton's window-state plugin saves and restores each window's size,
+/// position and title bar. Under Hyprland (Omarchy) the compositor owns all of
+/// that: a restored `decorated: true` would put back the GTK title bar the
+/// helper removes, and restored geometry fights the float/center rule. So the
+/// plugin skips Proton's windows there; every other desktop keeps it as is.
+fn window_state_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    let builder = tauri_plugin_window_state::Builder::new();
+    #[cfg(target_os = "linux")]
+    let builder = if helper::use_compositor_decorations() {
+        builder.with_denylist(&["main", "login"])
+    } else {
+        builder
+    };
+    builder.build()
+}
+
 /// Surfaces Proton's own window for the Omarchy panel (socket `open` op) and
 /// for forwarded single-instance launches. Login does not show the main window:
 /// it sets the one-shot request and emits the event the web bridge answers by
@@ -377,7 +393,7 @@ pub fn run() {
                 ))
                 .build(),
         )
-        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(window_state_plugin())
         .plugin(tauri_plugin_process::init());
 
     // Fork-local divergence: the Linux build is maintained locally and must
