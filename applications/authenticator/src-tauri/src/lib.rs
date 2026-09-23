@@ -31,9 +31,11 @@ fn apply_webkitgtk_workaround() {
 }
 
 /// Surfaces Proton's own window for the Omarchy panel (socket `open` op) and
-/// for forwarded single-instance launches. Login only sets the one-shot request
-/// and emits the event Proton's Device sync modal listens for; it never clears
-/// the manual lock latch.
+/// for forwarded single-instance launches. Login does not show the main window:
+/// it sets the one-shot request and emits the event the web bridge answers by
+/// opening Proton's own sign-in window (the same `log_in` path as the app's
+/// "Sign in" button), or the main window when already signed in. It never
+/// clears the manual lock latch.
 #[cfg(target_os = "linux")]
 struct TauriWindowControl(tauri::AppHandle);
 
@@ -41,8 +43,15 @@ struct TauriWindowControl(tauri::AppHandle);
 fn surface_main_window(app: &tauri::AppHandle, view: helper::OpenView) {
     match view {
         helper::OpenView::Login => {
+            // A second press while Proton's sign-in window is open focuses it.
+            if let Some(login) = app.get_webview_window("login") {
+                let _ = login.show();
+                let _ = login.set_focus();
+                return;
+            }
             app.state::<helper::HelperState>().request_login();
             let _ = app.emit_to("main", "omarchy-helper:login", ());
+            return;
         }
         helper::OpenView::Add => {
             let _ = app.emit_to("main", "omarchy-helper:add", ());
@@ -248,6 +257,7 @@ pub fn run() {
             biometrics::can_check_presence,
             biometrics::check_presence,
             helper::publish_helper_snapshot,
+            helper::show_helper_main_window,
             helper::take_helper_login_request,
             storage_key::generate_storage_key,
             storage_key::get_storage_key,

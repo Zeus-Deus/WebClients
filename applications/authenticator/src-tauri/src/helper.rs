@@ -497,6 +497,20 @@ pub fn take_helper_login_request(state: tauri::State<'_, HelperState>) -> bool {
     state.inner().take_login_request()
 }
 
+/// Shows Proton's main window. The web bridge calls this when the panel asks
+/// for sign-in but the account is already signed in, so the user lands on the
+/// app (and its sync settings) instead of nothing happening.
+#[tauri::command]
+#[specta::specta]
+pub fn show_helper_main_window(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 fn socket_path() -> io::Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|value| !value.is_empty())
