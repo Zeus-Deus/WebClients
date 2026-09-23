@@ -113,8 +113,15 @@ fn start_watchdog(app: tauri::AppHandle) {
                 let visible = window.is_visible().unwrap_or(true);
                 if helper::binary_replaced() && !visible {
                     log::warn!("[omarchy-helper] binary replaced by an update; restarting");
-                    app.exit(EXIT_FOR_UPDATE);
-                    return;
+                    // `AppHandle::exit(code)` ends the event loop with
+                    // `ControlFlow::Exit` and the process then exits 0, which
+                    // `Restart=on-failure` treats as a clean stop. Unlink the
+                    // socket and exit with the status systemd restarts on.
+                    if let Some(path) = app.try_state::<helper::SocketPath>() {
+                        helper::remove_socket(&path.0);
+                    }
+                    app.cleanup_before_exit();
+                    std::process::exit(EXIT_FOR_UPDATE);
                 }
                 let backoff_over =
                     last_reload.is_none_or(|instant| instant.elapsed() >= RELOAD_BACKOFF);
