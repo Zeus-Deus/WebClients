@@ -39,6 +39,13 @@ pub fn log_in(
     let should_send_destroyed = Arc::new(Mutex::new(true));
     let should_send_destroyed_clone = should_send_destroyed.clone();
 
+    // Under Hyprland (Omarchy) the compositor draws the frame, so drop the GTK
+    // title bar; every other desktop keeps it.
+    #[cfg(target_os = "linux")]
+    let decorations = !crate::helper::use_compositor_decorations();
+    #[cfg(not(target_os = "linux"))]
+    let decorations = true;
+
     let webview_handle = app.clone();
     let window = WebviewWindowBuilder::new(&app, "login", WebviewUrl::External(parsed_url.clone()))
         .theme(tauri_theme)
@@ -47,6 +54,7 @@ pub fn log_in(
         .inner_size(400.0, 600.0)
         .resizable(true)
         .always_on_top(true)
+        .decorations(decorations)
         .on_navigation(move |url| {
             let path = url.path();
 

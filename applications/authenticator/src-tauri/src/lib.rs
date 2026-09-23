@@ -319,6 +319,10 @@ pub fn run() {
             if background_mode && !login_requested {
                 win_builder = win_builder.visible(false);
             }
+            #[cfg(target_os = "linux")]
+            if helper::use_compositor_decorations() {
+                win_builder = win_builder.decorations(false);
+            }
 
             if !cfg!(debug_assertions) {
                 win_builder = win_builder.content_protected(true)

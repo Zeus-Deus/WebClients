@@ -21,7 +21,7 @@ const PROTOCOL_VERSION: u8 = 1;
 const HELPER_API: u8 = 2;
 // Revision of the Omarchy patch on top of Proton's release. Bumped whenever the
 // patch changes, independently of Proton's own version.
-const HELPER_PATCH_REVISION: u32 = 2;
+const HELPER_PATCH_REVISION: u32 = 3;
 const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -54,6 +54,18 @@ fn helper_version() -> String {
 /// True once the package manager has replaced the binary this process runs
 /// from (the kernel then reports the old inode as ` (deleted)`). The panel
 /// uses it to offer a restart instead of silently serving from old code.
+/// Whether Proton's windows should drop their own title bar. Hyprland (and so
+/// Omarchy) manages windows itself, so the GTK title bar with its minimize,
+/// maximize and close buttons only duplicates what the compositor provides.
+/// Every other desktop keeps Proton's normal title bar.
+pub fn use_compositor_decorations() -> bool {
+    compositor_manages_windows(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").as_deref())
+}
+
+fn compositor_manages_windows(hyprland_signature: Option<&std::ffi::OsStr>) -> bool {
+    hyprland_signature.is_some_and(|value| !value.is_empty())
+}
+
 pub fn binary_replaced() -> bool {
     fs::read_link("/proc/self/exe")
         .map(|path| path.to_string_lossy().ends_with(" (deleted)"))
@@ -901,6 +913,14 @@ pub fn start_socket_server(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn title_bar_is_dropped_only_under_hyprland() {
+        use std::ffi::OsStr;
+        assert!(super::compositor_manages_windows(Some(OsStr::new("abc_123"))));
+        assert!(!super::compositor_manages_windows(Some(OsStr::new(""))));
+        assert!(!super::compositor_manages_windows(None));
+    }
+
     use super::*;
 
     #[derive(Default)]
