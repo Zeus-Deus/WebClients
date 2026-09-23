@@ -12,9 +12,16 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROTOCOL_VERSION: u8 = 1;
+// Feature level of this helper, reported on every status/snapshot response so
+// the panel can tell a helper that is too old for it (and say "update") apart
+// from one that is broken. 2 adds the `open` op and the `latched` flag.
+const HELPER_API: u8 = 2;
+// Revision of the Omarchy patch on top of Proton's release. Bumped whenever the
+// patch changes, independently of Proton's own version.
+const HELPER_PATCH_REVISION: u32 = 2;
 const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -39,6 +46,44 @@ const CLIPBOARD_OWNERSHIP_GRACE: Duration = Duration::from_millis(150);
 // Source commit the binary was built from, embedded by build.rs so `status`
 // can identify the running artifact.
 const SOURCE_COMMIT: &str = env!("OMARCHY_HELPER_SOURCE_COMMIT");
+
+fn helper_version() -> String {
+    format!("{}+omarchy.{}", env!("CARGO_PKG_VERSION"), HELPER_PATCH_REVISION)
+}
+
+/// True once the package manager has replaced the binary this process runs
+/// from (the kernel then reports the old inode as ` (deleted)`). The panel
+/// uses it to offer a restart instead of silently serving from old code.
+pub fn binary_replaced() -> bool {
+    fs::read_link("/proc/self/exe")
+        .map(|path| path.to_string_lossy().ends_with(" (deleted)"))
+        .unwrap_or(false)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Which of Proton's own windows the panel may ask the helper to surface.
+/// Surfacing a window is all this does: it never clears the lock latch and
+/// never carries credentials, which are typed only into Proton's own UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenView {
+    /// The full Proton Authenticator window: add, edit, delete, reorder,
+    /// import, export, settings, sign out.
+    Manage,
+    /// Proton's own Device sync sign-in modal on top of that window.
+    Login,
+    /// Proton's own "add code" dialog on top of that window.
+    Add,
+}
+
+pub trait WindowControl: Send + Sync {
+    fn open(&self, view: OpenView);
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -115,8 +160,13 @@ pub struct HelperState {
     published_at: Arc<Mutex<Option<Instant>>>,
     manual_locked: Arc<AtomicBool>,
     login_requested: Arc<AtomicBool>,
+    // Serialises `copy` against `lock`. Without it a copy that had already
+    // passed its snapshot check could hand a code to wl-copy after `lock`
+    // returned, leaving that code on the clipboard for the full TTL.
+    op_gate: Arc<Mutex<()>>,
     clipboard_generation: Arc<AtomicU64>,
     clipboard_owner: Arc<Mutex<Option<ClipboardOwner>>>,
+    started: Arc<Mutex<Option<Instant>>>,
     // Random per-process identifier. Generations restart at 1 with every
     // helper process, so a client keeping a monotonic floor across a helper
     // restart would reject every fresh snapshot until it caught up. Sending the
@@ -136,6 +186,7 @@ impl HelperState {
     pub fn new() -> Self {
         Self {
             instance: new_instance_id(),
+            started: Arc::new(Mutex::new(Some(Instant::now()))),
             ..Self::default()
         }
     }
@@ -241,16 +292,52 @@ impl HelperState {
         Ok(())
     }
 
+    /// How long since the webview last published (or since the helper started
+    /// if it never has). The watchdog reloads a webview that stops publishing:
+    /// a crashed WebKit web process otherwise leaves the helper running but
+    /// serving nothing, indefinitely.
+    pub fn publication_age(&self) -> Duration {
+        let published = *self
+            .published_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let started = *self
+            .started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        published
+            .or(started)
+            .map(|instant| instant.elapsed())
+            .unwrap_or_default()
+    }
+
+    pub fn latched(&self) -> bool {
+        self.manual_locked.load(Ordering::Acquire)
+    }
+
+    fn gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.op_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // A snapshot whose publisher has stalled is served as if nothing had been
     // published. Only `ready` carries codes, so staleness degrades that state to
     // `unavailable` and drops the rows; states such as `locked` or `needs_login`
-    // carry none and stay true until the app republishes.
+    // carry none and stay true until the app republishes. Independently of
+    // publication age, a row whose own TOTP window has closed is never served:
+    // the code it carries has already rolled over.
     fn current_snapshot(&self) -> (HelperSnapshot, bool) {
-        let snapshot = self
+        self.current_snapshot_at(unix_now())
+    }
+
+    fn current_snapshot_at(&self, now: u64) -> (HelperSnapshot, bool) {
+        let mut snapshot = self
             .snapshot
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        snapshot.entries.retain(|entry| entry.valid_until > now);
         let fresh = self
             .published_at
             .lock()
@@ -273,6 +360,7 @@ impl HelperState {
     /// the new generation. The write guard is released before the clipboard
     /// owner is terminated so a slow `wl-copy` cannot stall `publish`.
     fn lock(&self) -> u64 {
+        let _gate = self.gate();
         let generation = {
             let mut snapshot = self
                 .snapshot
@@ -318,6 +406,17 @@ struct HelperRequest {
     id: String,
     op: String,
     item_id: Option<String>,
+    #[serde(default)]
+    view: Option<String>,
+}
+
+fn parse_view(value: Option<&str>) -> Option<OpenView> {
+    match value {
+        Some("manage") => Some(OpenView::Manage),
+        Some("login") => Some(OpenView::Login),
+        Some("add") => Some(OpenView::Add),
+        _ => None,
+    }
 }
 
 fn bounded_text(value: &str, max: usize) -> bool {
@@ -514,6 +613,8 @@ fn snapshot_response(id: &str, snapshot: &HelperSnapshot, stale: bool, instance:
         map.insert("stale".into(), json!(stale));
         map.insert("instance".into(), json!(instance));
         map.insert("sourceCommit".into(), json!(SOURCE_COMMIT));
+        map.insert("api".into(), json!(HELPER_API));
+        map.insert("helperVersion".into(), json!(helper_version()));
     }
     envelope(id, body)
 }
@@ -563,7 +664,7 @@ fn copy_to_clipboard(state: &HelperState, code: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
+fn handle_request(state: &HelperState, windows: &dyn WindowControl, request: HelperRequest) -> Value {
     if request.v != PROTOCOL_VERSION || !valid_id(&request.id) {
         return envelope(
             &request.id,
@@ -581,6 +682,10 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
                 &request.id,
                 json!({
                     "ok": true,
+                    "api": HELPER_API,
+                    "helperVersion": helper_version(),
+                    "latched": state.latched(),
+                    "binaryReplaced": binary_replaced(),
                     "state": snapshot.state,
                     "locked": snapshot.locked,
                     "synced": snapshot.synced,
@@ -595,7 +700,27 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
         }
         "snapshot" => {
             let (snapshot, stale) = state.current_snapshot();
-            snapshot_response(&request.id, &snapshot, stale, state.instance())
+            let mut response = snapshot_response(&request.id, &snapshot, stale, state.instance());
+            if let Value::Object(map) = &mut response {
+                map.insert("latched".into(), json!(state.latched()));
+                map.insert("binaryReplaced".into(), json!(binary_replaced()));
+            }
+            response
+        }
+        // Surfaces one of Proton's own windows. It carries no credentials, does
+        // not touch the snapshot or the lock latch, and is exactly what the
+        // single-instance D-Bus path already allows any same-uid process to do;
+        // routing it through this socket lets the panel reach the *running*
+        // hardened service instead of launching a second, unconfined process.
+        "open" => {
+            let Some(view) = parse_view(request.view.as_deref()) else {
+                return envelope(&request.id, json!({ "ok": false, "error": "invalid_view" }));
+            };
+            if request.item_id.is_some() {
+                return envelope(&request.id, json!({ "ok": false, "error": "invalid_request" }));
+            }
+            windows.open(view);
+            envelope(&request.id, json!({ "ok": true, "opened": true }))
         }
         "copy" => {
             let Some(item_id) = request.item_id.filter(|id| valid_id(id)) else {
@@ -604,6 +729,10 @@ fn handle_request(state: &HelperState, request: HelperRequest) -> Value {
                     json!({ "ok": false, "error": "invalid_item_id" }),
                 );
             };
+            // Held until wl-copy owns (or failed to own) the selection, so a
+            // concurrent `lock` either runs first and this copy sees the latch,
+            // or runs after and terminates this very clipboard owner.
+            let _gate = state.gate();
             let (snapshot, stale) = state.current_snapshot();
             if stale {
                 return envelope(&request.id, json!({ "ok": false, "error": "stale" }));
@@ -682,7 +811,11 @@ fn read_request_line(stream: &UnixStream, deadline: Instant) -> io::Result<Strin
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "request is not utf-8"))
 }
 
-fn handle_client(state: HelperState, mut stream: UnixStream) -> io::Result<()> {
+fn handle_client(
+    state: HelperState,
+    windows: &dyn WindowControl,
+    mut stream: UnixStream,
+) -> io::Result<()> {
     let deadline = Instant::now() + CLIENT_DEADLINE;
     stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
     if peer_uid(&stream)? != unsafe { libc::geteuid() } {
@@ -698,7 +831,7 @@ fn handle_client(state: HelperState, mut stream: UnixStream) -> io::Result<()> {
     }
     let request: HelperRequest = serde_json::from_str(line.trim_end())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid json"))?;
-    let mut encoded = serde_json::to_vec(&handle_request(&state, request))?;
+    let mut encoded = serde_json::to_vec(&handle_request(&state, windows, request))?;
     encoded.push(b'\n');
     if encoded.len() > MAX_RESPONSE_BYTES {
         encoded = b"{\"v\":1,\"id\":\"\",\"ok\":false,\"error\":\"response_too_large\"}\n".to_vec();
@@ -719,7 +852,10 @@ impl Drop for ConnectionGuard {
     }
 }
 
-pub fn start_socket_server(state: HelperState) -> io::Result<PathBuf> {
+pub fn start_socket_server(
+    state: HelperState,
+    windows: Arc<dyn WindowControl>,
+) -> io::Result<PathBuf> {
     let path = socket_path()?;
     let listener = prepare_socket(&path)?;
     let active_connections = Arc::new(AtomicUsize::new(0));
@@ -736,12 +872,13 @@ pub fn start_socket_server(state: HelperState) -> io::Result<PathBuf> {
                     continue;
                 }
                 let state = state.clone();
+                let windows = windows.clone();
                 let guard = ConnectionGuard(active_connections.clone());
                 let _ = thread::Builder::new()
                     .name("omarchy-authenticator-client".into())
                     .spawn(move || {
                         let _guard = guard;
-                        let _ = handle_client(state, stream);
+                        let _ = handle_client(state, windows.as_ref(), stream);
                     });
             }
         })?;
@@ -752,6 +889,19 @@ pub fn start_socket_server(state: HelperState) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct FakeWindows(Mutex<Vec<OpenView>>);
+
+    impl WindowControl for FakeWindows {
+        fn open(&self, view: OpenView) {
+            self.0.lock().unwrap().push(view);
+        }
+    }
+
+    fn handle(state: &HelperState, request: HelperRequest) -> Value {
+        handle_request(state, &FakeWindows::default(), request)
+    }
+
     struct FakeClipboardProcess(Arc<AtomicBool>);
 
     impl ClipboardProcess for FakeClipboardProcess {
@@ -761,13 +911,14 @@ mod tests {
     }
 
     fn valid_snapshot() -> HelperSnapshot {
+        let now = unix_now();
         HelperSnapshot {
             state: "ready".into(),
             locked: false,
             synced: true,
             account: "test@example.test".into(),
             generation: 1,
-            now: 59,
+            now,
             entries: vec![HelperEntry {
                 id: "fixture-rfc6238".into(),
                 name: "test".into(),
@@ -776,7 +927,7 @@ mod tests {
                 code: "94287082".into(),
                 next_code: "37359152".into(),
                 period: 30,
-                valid_until: 60,
+                valid_until: now - (now % 30) + 30,
             }],
         }
     }
@@ -813,13 +964,14 @@ mod tests {
 
         let lock_stopped = Arc::new(AtomicBool::new(false));
         state.replace_clipboard_owner(Box::new(FakeClipboardProcess(lock_stopped.clone())));
-        let _ = handle_request(
+        let _ = handle(
             &state,
             HelperRequest {
                 v: 1,
                 id: "lock-owner".into(),
                 op: "lock".into(),
                 item_id: None,
+                view: None,
             },
         );
         assert!(lock_stopped.load(Ordering::Acquire));
@@ -889,13 +1041,14 @@ mod tests {
     fn lock_clears_rows_and_advances_generation() {
         let state = HelperState::default();
         *state.snapshot.write().unwrap() = valid_snapshot();
-        let response = handle_request(
+        let response = handle(
             &state,
             HelperRequest {
                 v: 1,
                 id: "abcd".into(),
                 op: "lock".into(),
                 item_id: None,
+                view: None,
             },
         );
         assert_eq!(response["ok"], true);
@@ -912,13 +1065,14 @@ mod tests {
         assert!(state.snapshot.read().unwrap().locked);
         assert!(state.snapshot.read().unwrap().entries.is_empty());
 
-        let unlock_response = handle_request(
+        let unlock_response = handle(
             &state,
             HelperRequest {
                 v: 1,
                 id: "efgh".into(),
                 op: "unlock".into(),
                 item_id: None,
+                view: None,
             },
         );
         assert_eq!(unlock_response["ok"], false);
@@ -963,13 +1117,14 @@ mod tests {
         state.publish(valid_snapshot()).unwrap();
         backdate_publication(&state, SNAPSHOT_TTL + Duration::from_secs(1));
 
-        let response = handle_request(
+        let response = handle(
             &state,
             HelperRequest {
                 v: 1,
                 id: "stale-snapshot".into(),
                 op: "snapshot".into(),
                 item_id: None,
+                view: None,
             },
         );
         assert_eq!(response["ok"], true);
@@ -977,13 +1132,14 @@ mod tests {
         assert_eq!(response["state"], "unavailable");
         assert_eq!(response["entries"].as_array().unwrap().len(), 0);
 
-        let status = handle_request(
+        let status = handle(
             &state,
             HelperRequest {
                 v: 1,
                 id: "stale-status".into(),
                 op: "status".into(),
                 item_id: None,
+                view: None,
             },
         );
         assert_eq!(status["stale"], true);
@@ -997,13 +1153,14 @@ mod tests {
         state.publish(valid_snapshot()).unwrap();
         backdate_publication(&state, SNAPSHOT_TTL + Duration::from_secs(1));
 
-        let response = handle_request(
+        let response = handle(
             &state,
             HelperRequest {
                 v: 1,
                 id: "stale-copy".into(),
                 op: "copy".into(),
                 item_id: Some("fixture-rfc6238".into()),
+                view: None,
             },
         );
         assert_eq!(response["ok"], false);
@@ -1048,6 +1205,7 @@ mod tests {
             id: "req".into(),
             op: op.into(),
             item_id: item_id.map(Into::into),
+            view: None,
         }
     }
 
@@ -1061,7 +1219,7 @@ mod tests {
 
         first.publish(valid_snapshot()).unwrap();
         for op in ["status", "snapshot", "lock"] {
-            let response = handle_request(&first, request(op, None));
+            let response = handle(&first, request(op, None));
             assert_eq!(response["ok"], true, "{op}");
             assert_eq!(response["instance"], first.instance(), "{op}");
         }
@@ -1073,7 +1231,7 @@ mod tests {
     fn status_reports_provenance_and_sign_in_but_never_the_account() {
         let state = HelperState::new();
         state.publish(valid_snapshot()).unwrap();
-        let status = handle_request(&state, request("status", None));
+        let status = handle(&state, request("status", None));
         assert_eq!(status["ok"], true);
         assert_eq!(status["signedIn"], true);
         assert!(status.get("account").is_none());
@@ -1205,5 +1363,83 @@ mod tests {
         remove_socket(&socket);
         assert!(!socket.exists());
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn expired_rows_are_never_served_even_from_a_fresh_snapshot() {
+        let state = HelperState::new();
+        let snapshot = valid_snapshot();
+        let until = snapshot.entries[0].valid_until;
+        state.publish(snapshot).unwrap();
+        assert_eq!(state.current_snapshot_at(until - 1).0.entries.len(), 1);
+        let (expired, stale) = state.current_snapshot_at(until);
+        assert!(!stale);
+        assert!(expired.entries.is_empty());
+    }
+
+    #[test]
+    fn open_surfaces_only_known_views_and_leaves_the_latch_alone() {
+        let state = HelperState::new();
+        state.lock();
+        let windows = FakeWindows::default();
+        let mut open = request("open", None);
+        open.view = Some("manage".into());
+        assert_eq!(handle_request(&state, &windows, open)["ok"], true);
+        let mut login = request("open", None);
+        login.view = Some("login".into());
+        assert_eq!(handle_request(&state, &windows, login)["ok"], true);
+        for bad in [None, Some("settings"), Some("")] {
+            let mut rejected = request("open", None);
+            rejected.view = bad.map(Into::into);
+            let response = handle_request(&state, &windows, rejected);
+            assert_eq!(response["ok"], false);
+            assert_eq!(response["error"], "invalid_view");
+        }
+        let mut add = request("open", None);
+        add.view = Some("add".into());
+        assert_eq!(handle_request(&state, &windows, add)["ok"], true);
+        assert_eq!(
+            *windows.0.lock().unwrap(),
+            vec![OpenView::Manage, OpenView::Login, OpenView::Add]
+        );
+        assert!(state.latched());
+        let status = handle(&state, request("status", None));
+        assert_eq!(status["latched"], true);
+        assert_eq!(status["locked"], true);
+        assert_eq!(status["api"], HELPER_API);
+    }
+
+    #[test]
+    fn lock_waits_for_an_in_flight_copy_gate() {
+        let state = HelperState::new();
+        state.publish(valid_snapshot()).unwrap();
+        let gate = state.gate();
+        let locker = state.clone();
+        let handle = thread::spawn(move || locker.lock());
+        thread::sleep(Duration::from_millis(100));
+        assert!(!state.latched(), "lock must not proceed while a copy holds the gate");
+        drop(gate);
+        handle.join().unwrap();
+        assert!(state.latched());
+        let copy = handle_request(
+            &state,
+            &FakeWindows::default(),
+            request("copy", Some("fixture-rfc6238")),
+        );
+        assert_eq!(copy["ok"], false);
+        assert_eq!(copy["error"], "locked");
+    }
+
+    #[test]
+    fn responses_report_api_and_helper_version() {
+        let state = HelperState::new();
+        state.publish(valid_snapshot()).unwrap();
+        for op in ["status", "snapshot"] {
+            let response = handle(&state, request(op, None));
+            assert_eq!(response["api"], HELPER_API, "{op}");
+            assert_eq!(response["helperVersion"], helper_version(), "{op}");
+            assert_eq!(response["latched"], false, "{op}");
+        }
+        assert!(helper_version().contains("+omarchy."));
     }
 }

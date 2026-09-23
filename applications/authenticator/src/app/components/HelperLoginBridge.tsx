@@ -9,9 +9,15 @@ import runtime from '../../lib/tauri/runtime';
 import { ProtonSyncModal } from './Settings/Sync/ProtonSyncModal';
 
 const LOGIN_EVENT = 'omarchy-helper:login';
+const ADD_EVENT = 'omarchy-helper:add';
 const TAKE_LOGIN_REQUEST = 'take_helper_login_request';
 
-export const HelperLoginBridge: FC = () => {
+type Props = { onAddRequested?: () => void };
+
+/** Surfaces Proton's own UI when the Omarchy panel asks for it: the Device sync
+ * sign-in modal (`login`) or the add-code dialog (`add`). Nothing here reads or
+ * forwards credentials; the user types them into Proton's own components. */
+export const HelperLoginBridge: FC<Props> = ({ onAddRequested }) => {
     const [open, setOpen] = useState(false);
     const enabled = shouldEnableHelper(
         runtime.isTauri,
@@ -30,6 +36,18 @@ export const HelperLoginBridge: FC = () => {
                 logger.error('[omarchy-helper] could not consume login request');
             });
         };
+
+        let disposeAdd: undefined | (() => void);
+        void listen(ADD_EVENT, () => {
+            if (active) onAddRequested?.();
+        })
+            .then((unlisten) => {
+                if (!active) unlisten();
+                else disposeAdd = unlisten;
+            })
+            .catch(() => {
+                logger.error('[omarchy-helper] could not initialize add bridge');
+            });
 
         void listen(LOGIN_EVENT, consume)
             .then((unlisten) => {
@@ -50,8 +68,9 @@ export const HelperLoginBridge: FC = () => {
         return () => {
             active = false;
             dispose?.();
+            disposeAdd?.();
         };
-    }, [enabled]);
+    }, [enabled, onAddRequested]);
 
     return open ? <ProtonSyncModal onClose={() => setOpen(false)} /> : null;
 };

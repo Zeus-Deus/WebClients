@@ -1,4 +1,4 @@
-import { type FC, useState } from 'react';
+import { type FC, useCallback, useState } from 'react';
 
 import { HelperLoginBridge } from 'proton-authenticator/app/components/HelperLoginBridge';
 import { ItemAdd } from 'proton-authenticator/app/components/Items/ItemAdd';
@@ -11,7 +11,7 @@ export const App: FC = () => {
     const [search, setSearch] = useState('');
 
     const [dialogOpen, setDialogOpen] = useState(false);
-    const handleNewClick = () => setDialogOpen(true);
+    const handleNewClick = useCallback(() => setDialogOpen(true), []);
 
     const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -25,7 +25,7 @@ export const App: FC = () => {
             />
 
             <Items search={search} handleNewClick={handleNewClick} />
-            <HelperLoginBridge />
+            <HelperLoginBridge onAddRequested={handleNewClick} />
 
             {dialogOpen && <ItemAdd onClose={() => setDialogOpen(false)} />}
             {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} />}

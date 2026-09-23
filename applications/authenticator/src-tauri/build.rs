@@ -5,6 +5,15 @@ use std::process::Command;
 /// instead of inferring it from file mtimes. Falls back to `unknown` outside a
 /// git checkout rather than failing the build.
 fn helper_source_commit() -> String {
+    // Package builds run from a release tarball with no `.git`, so the
+    // packager passes the exact source commit of the patched tree instead. It
+    // must be a bare 40-hex commit; anything else falls back to git.
+    if let Ok(value) = std::env::var("OMARCHY_HELPER_SOURCE_COMMIT") {
+        let value = value.trim().to_string();
+        if value.len() == 40 && value.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return value.to_ascii_lowercase();
+        }
+    }
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -31,6 +40,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=../../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../../.git/index");
+    println!("cargo:rerun-if-env-changed=OMARCHY_HELPER_SOURCE_COMMIT");
     println!(
         "cargo:rustc-env=OMARCHY_HELPER_SOURCE_COMMIT={}",
         helper_source_commit()

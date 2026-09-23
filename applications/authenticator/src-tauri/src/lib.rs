@@ -30,6 +30,94 @@ fn apply_webkitgtk_workaround() {
     }
 }
 
+/// Surfaces Proton's own window for the Omarchy panel (socket `open` op) and
+/// for forwarded single-instance launches. Login only sets the one-shot request
+/// and emits the event Proton's Device sync modal listens for; it never clears
+/// the manual lock latch.
+#[cfg(target_os = "linux")]
+struct TauriWindowControl(tauri::AppHandle);
+
+#[cfg(target_os = "linux")]
+fn surface_main_window(app: &tauri::AppHandle, view: helper::OpenView) {
+    match view {
+        helper::OpenView::Login => {
+            app.state::<helper::HelperState>().request_login();
+            let _ = app.emit_to("main", "omarchy-helper:login", ());
+        }
+        helper::OpenView::Add => {
+            let _ = app.emit_to("main", "omarchy-helper:add", ());
+        }
+        helper::OpenView::Manage => {}
+    }
+    let _ = app.get_webview_window("main").and_then(|window| {
+        let _ = window.show();
+        let _ = window.unminimize();
+        window.set_focus().ok()
+    });
+}
+
+#[cfg(target_os = "linux")]
+impl helper::WindowControl for TauriWindowControl {
+    fn open(&self, view: helper::OpenView) {
+        let app = self.0.clone();
+        // Window calls must run on the event loop thread; the socket server
+        // calls this from its own client thread.
+        let _ = self
+            .0
+            .run_on_main_thread(move || surface_main_window(&app, view));
+    }
+}
+
+// A healthy webview publishes once a second, including while Proton's own app
+// lock is engaged, so this long a silence means its web process died or hung.
+#[cfg(target_os = "linux")]
+const PUBLISHER_STALL: std::time::Duration = std::time::Duration::from_secs(45);
+#[cfg(target_os = "linux")]
+const RELOAD_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
+// Exit status that asks systemd (`Restart=on-failure`) to start the helper
+// again from the binary the package manager just installed.
+#[cfg(target_os = "linux")]
+const EXIT_FOR_UPDATE: i32 = 75;
+
+/// Background supervision for the hidden helper:
+/// - reloads the webview when it stops publishing (a WebKit web process that
+///   crashed otherwise leaves the service "active" while serving nothing);
+/// - after a package upgrade replaced the binary, exits so systemd restarts it
+///   on the new version — but only while the window is hidden, so a sign-in or
+///   edit in progress is never cut off, and never while the manual lock latch
+///   is set, because a restart is what releases it.
+#[cfg(target_os = "linux")]
+fn start_watchdog(app: tauri::AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("omarchy-authenticator-watchdog".into())
+        .spawn(move || {
+            let mut last_reload: Option<std::time::Instant> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                let state = app.state::<helper::HelperState>();
+                if state.latched() {
+                    continue;
+                }
+                let Some(window) = app.get_webview_window("main") else {
+                    continue;
+                };
+                let visible = window.is_visible().unwrap_or(true);
+                if helper::binary_replaced() && !visible {
+                    log::warn!("[omarchy-helper] binary replaced by an update; restarting");
+                    app.exit(EXIT_FOR_UPDATE);
+                    return;
+                }
+                let backoff_over =
+                    last_reload.is_none_or(|instant| instant.elapsed() >= RELOAD_BACKOFF);
+                if state.publication_age() >= PUBLISHER_STALL && backoff_over {
+                    log::warn!("[omarchy-helper] webview stopped publishing; reloading");
+                    last_reload = Some(std::time::Instant::now());
+                    let _ = window.reload();
+                }
+            }
+        });
+}
+
 #[cfg(target_os = "linux")]
 fn helper_window_mode<I, S>(args: I) -> (bool, bool)
 where
@@ -244,8 +332,12 @@ pub fn run() {
             {
                 let socket_path = helper::start_socket_server(
                     app.state::<helper::HelperState>().inner().clone(),
+                    std::sync::Arc::new(TauriWindowControl(app.handle().clone())),
                 )?;
                 app.manage(helper::SocketPath(socket_path));
+                if background_mode {
+                    start_watchdog(app.handle().clone());
+                }
             }
 
             Ok(())
@@ -278,21 +370,23 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Forwarded argv arrives over the session bus from any same-uid
             // client, so it is treated as a request, not a command line.
+            // Login does not need an unlocked snapshot, and neither path calls
+            // `unlock`: any same-uid process could otherwise clear the manual
+            // lock latch just by running the binary with `--login`.
             #[cfg(target_os = "linux")]
-            match forwarded_action(args.iter()) {
-                ForwardedAction::Ignore => return,
-                ForwardedAction::Login => {
-                    let state = app.state::<helper::HelperState>();
-                    // Login does not need an unlocked snapshot. Calling `unlock`
-                    // here would let any same-uid process clear the manual lock
-                    // latch just by running the binary with `--login`.
-                    state.request_login();
-                    let _ = app.emit_to("main", "omarchy-helper:login", ());
+            {
+                match forwarded_action(args.iter()) {
+                    ForwardedAction::Ignore => {}
+                    ForwardedAction::Login => surface_main_window(app, helper::OpenView::Login),
+                    ForwardedAction::ShowWindow => {
+                        surface_main_window(app, helper::OpenView::Manage)
+                    }
                 }
-                ForwardedAction::ShowWindow => {}
+                return;
             }
             #[cfg(not(target_os = "linux"))]
             let _ = args;
+            #[cfg(not(target_os = "linux"))]
             let _ = app.get_webview_window("main").and_then(|window| {
                 let _ = window.show();
                 let _ = window.unminimize();
