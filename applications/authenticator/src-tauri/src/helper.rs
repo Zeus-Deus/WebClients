@@ -21,7 +21,7 @@ const PROTOCOL_VERSION: u8 = 1;
 const HELPER_API: u8 = 2;
 // Revision of the Omarchy patch on top of Proton's release. Bumped whenever the
 // patch changes, independently of Proton's own version.
-const HELPER_PATCH_REVISION: u32 = 4;
+const HELPER_PATCH_REVISION: u32 = 5;
 const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -70,6 +70,31 @@ pub fn binary_replaced() -> bool {
     fs::read_link("/proc/self/exe")
         .map(|path| path.to_string_lossy().ends_with(" (deleted)"))
         .unwrap_or(false)
+}
+
+/// Keeps rows current across a TOTP rollover. The webview republishes about
+/// once a second, so right after a window closes the stored row still carries
+/// the old code for up to a second. Its `next_code` was generated for exactly
+/// the window that just opened, so the row is served with that code instead
+/// (and no next code, which the panel shows as pending) until the webview's
+/// fresh row replaces it. A row more than one window old is dropped: a code is
+/// never served outside the window it was generated for.
+fn roll_entries_forward(entries: Vec<HelperEntry>, now: u64) -> Vec<HelperEntry> {
+    entries
+        .into_iter()
+        .filter_map(|mut entry| {
+            if entry.valid_until > now {
+                return Some(entry);
+            }
+            let next_until = entry.valid_until.checked_add(u64::from(entry.period))?;
+            if entry.next_code.is_empty() || next_until <= now {
+                return None;
+            }
+            entry.code = std::mem::take(&mut entry.next_code);
+            entry.valid_until = next_until;
+            Some(entry)
+        })
+        .collect()
 }
 
 fn unix_now() -> u64 {
@@ -349,7 +374,7 @@ impl HelperState {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        snapshot.entries.retain(|entry| entry.valid_until > now);
+        snapshot.entries = roll_entries_forward(std::mem::take(&mut snapshot.entries), now);
         let fresh = self
             .published_at
             .lock()
@@ -1400,15 +1425,37 @@ mod tests {
     }
 
     #[test]
-    fn expired_rows_are_never_served_even_from_a_fresh_snapshot() {
+    fn rollover_serves_the_next_code_and_never_an_expired_one() {
         let state = HelperState::new();
         let snapshot = valid_snapshot();
         let until = snapshot.entries[0].valid_until;
+        let period = u64::from(snapshot.entries[0].period);
         state.publish(snapshot).unwrap();
-        assert_eq!(state.current_snapshot_at(until - 1).0.entries.len(), 1);
-        let (expired, stale) = state.current_snapshot_at(until);
+
+        let (before, _) = state.current_snapshot_at(until - 1);
+        assert_eq!(before.entries[0].code, "94287082");
+        assert_eq!(before.entries[0].next_code, "37359152");
+
+        // The window just closed: the row carries the code generated for the
+        // new window, with no next code, instead of disappearing.
+        let (rolled, stale) = state.current_snapshot_at(until);
         assert!(!stale);
-        assert!(expired.entries.is_empty());
+        assert_eq!(rolled.entries.len(), 1);
+        assert_eq!(rolled.entries[0].code, "37359152");
+        assert_eq!(rolled.entries[0].next_code, "");
+        assert_eq!(rolled.entries[0].valid_until, until + period);
+
+        // More than one window old: nothing left that is current.
+        let (gone, _) = state.current_snapshot_at(until + period);
+        assert!(gone.entries.is_empty());
+    }
+
+    #[test]
+    fn a_row_without_a_next_code_is_dropped_at_rollover() {
+        let mut entry = valid_snapshot().entries.remove(0);
+        entry.next_code = String::new();
+        let until = entry.valid_until;
+        assert!(super::roll_entries_forward(vec![entry], until).is_empty());
     }
 
     #[test]
