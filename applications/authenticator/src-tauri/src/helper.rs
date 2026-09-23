@@ -21,7 +21,7 @@ const PROTOCOL_VERSION: u8 = 1;
 const HELPER_API: u8 = 2;
 // Revision of the Omarchy patch on top of Proton's release. Bumped whenever the
 // patch changes, independently of Proton's own version.
-const HELPER_PATCH_REVISION: u32 = 1;
+const HELPER_PATCH_REVISION: u32 = 2;
 const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 const MAX_ENTRIES: usize = 200;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
